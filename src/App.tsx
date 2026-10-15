@@ -22,6 +22,7 @@ import { DEMO_PROJECT_SIGNAL } from './utils/sampleData';
 import { Header } from './components/Header';
 import { PipelineNav } from './components/PipelineNav';
 import { ProjectModal } from './components/ProjectModal';
+import { SettingsModal } from './components/SettingsModal';
 import { ProjectOverview } from './components/stages/ProjectOverview';
 import { ScriptStage } from './components/stages/ScriptStage';
 import { WorldBibleStage } from './components/stages/WorldBibleStage';
@@ -45,10 +46,12 @@ export default function App() {
   const [currentStage, setCurrentStage] = useState<PipelineStage>('project');
   const [isSaving, setIsSaving] = useState(false);
   const [hasGeminiKey, setHasGeminiKey] = useState(false);
+  const [hasAiKey, setHasAiKey] = useState(false);
 
   // Modals
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
   const [isCreatingNew, setIsCreatingNew] = useState(false);
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
 
   // Initial load
   useEffect(() => {
@@ -59,6 +62,7 @@ export default function App() {
     // 2. Health check
     checkServerHealth().then((res) => {
       setHasGeminiKey(res.hasGeminiKey);
+      setHasAiKey(Boolean(res.hasAiKey));
     });
   }, []);
 
@@ -226,7 +230,8 @@ export default function App() {
           setIsProjectModalOpen(true);
         }}
         isSaving={isSaving}
-        hasGeminiKey={hasGeminiKey}
+        hasAiKey={hasAiKey}
+        onOpenSettings={() => setIsSettingsModalOpen(true)}
       />
 
       {/* Sequential Pipeline Navigation Bar */}
@@ -351,6 +356,16 @@ export default function App() {
         }
         onSave={handleSaveProjectMetadata}
         isNew={isCreatingNew}
+      />
+      <SettingsModal
+        isOpen={isSettingsModalOpen}
+        onClose={() => setIsSettingsModalOpen(false)}
+        onSaved={() => {
+          checkServerHealth().then((res) => {
+            setHasGeminiKey(res.hasGeminiKey);
+            setHasAiKey(Boolean(res.hasAiKey));
+          });
+        }}
       />
     </div>
   );

@@ -25,19 +25,18 @@ SceneCraft is built as a full-stack, modular TypeScript application designed to 
 |   |                    Express Backend (server.ts)                |   |
 |   |  - Static & Vite Dev Middleware                               |   |
 |   |  - Input Validation & Schema Enforcement                      |   |
-|   |  - Secure Gemini API Orchestrator (Server-Side Only)          |   |
-|   |  - Health & Key Verification Endpoint                         |   |
+|   |  - Session-scoped Gemini/OpenAI/Anthropic/HF text adapters    |   |
+|   |  - Gemini-only image/audio adapters                           |   |
+|   |  - Health, settings, and key-verification endpoints            |   |
 |   +-------------------------------+-------------------------------+   |
 +-----------------------------------|-----------------------------------+
                                     |
-                    Official @google/genai SDK
-                                    v
-+-----------------------------------------------------------------------+
-|                           Gemini AI Services                          |
-|  - gemini-3.8-flash: Structured Screenplay, World Bible, Scene Engine |
-|  - gemini-3.1-flash-lite-image: Cinematic Storyboard Visuals          |
-|  - gemini-3.8-flash-lite-tts: Dialogue & Narrative Speech Synthesis   |
-+-----------------------------------------------------------------------+
+               Gemini REST API / OpenAI Chat Completions / Gemini SDK
+                            v
+            +-----------------------------------------------------------------------+
+            | Text models: Gemini, OpenAI, Anthropic Claude, Hugging Face Qwen     |
+            | Gemini media: 2.5 Flash Image and 2.5 Flash Preview TTS              |
+            +-----------------------------------------------------------------------+
 ```
 
 ---
@@ -45,9 +44,9 @@ SceneCraft is built as a full-stack, modular TypeScript application designed to 
 ## Client-Server Separation & Security
 
 ### Why Server-Side AI?
-1. **API Key Security**: The Gemini API key (`GEMINI_API_KEY`) is read exclusively on the Node.js server via `process.env.GEMINI_API_KEY`. It is never bundled, leaked, or accessible via the client browser.
-2. **Schema Enforcement**: Structured JSON responses from Gemini are validated server-side before returning clean, structured payloads to the React client.
-3. **Telemetry & Uniformity**: The server configures the official `@google/genai` client with the mandatory `User-Agent: aistudio-build` header.
+1. **API Key Security**: Environment keys are read server-side. Web-entered keys are held in server memory under a random `HttpOnly`, `SameSite=Strict` session cookie; API responses expose only whether a key exists and a fixed mask. They are never stored in browser storage or project data.
+2. **Schema Enforcement**: Structured JSON responses are validated server-side before returning to the React client.
+3. **Bounded Requests**: Session limits cap generation frequency, prompts, and output tokens. Retries are limited to transient failures; invalid credentials and quota/rate-limit errors are not retried.
 
 ---
 
@@ -58,6 +57,8 @@ SceneCraft follows a resilient local-first architecture:
 - **Autosave Engine**: `App.tsx` contains a debounced autosave effect (600ms) that commits all edits without interrupting user typing.
 - **Portability**: The Export Suite allows users to export complete project packages as `.json` files and import them on any device.
 - **Offline / Demo Resilience**: If no Gemini API key is configured on the host server, the application enters a clean, fully operational **Demo Mode** loaded with the complete *The Last Signal* short film project.
+- **AI Settings**: Provider/model preferences and web-entered keys remain server-side in memory and are lost when the process restarts. Projects continue to autosave locally; they do not contain keys or AI settings.
+- **Media Provider**: Image and TTS generation are Gemini-only. An OpenAI text selection returns an explicit error for those operations instead of switching providers.
 
 ---
 

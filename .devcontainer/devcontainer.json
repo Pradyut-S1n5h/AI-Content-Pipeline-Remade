@@ -1,0 +1,13 @@
+{
+  "name": "SceneCraft",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:1-22-bookworm",
+  "postCreateCommand": "npm ci --no-audit --no-fund",
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "SceneCraft",
+      "onAutoForward": "openBrowser",
+      "visibility": "private"
+    }
+  }
+}

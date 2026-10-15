@@ -1,6 +1,6 @@
 import React from 'react';
 import { Project } from '../types';
-import { Film, Plus, FolderOpen, Sparkles, Check, RefreshCw } from 'lucide-react';
+import { Film, Plus, FolderOpen, Check, RefreshCw, Settings2 } from 'lucide-react';
 
 interface HeaderProps {
   project: Project;
@@ -9,7 +9,8 @@ interface HeaderProps {
   onNewProject: () => void;
   onOpenProjectModal: () => void;
   isSaving: boolean;
-  hasGeminiKey: boolean;
+  hasAiKey: boolean;
+  onOpenSettings: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -19,7 +20,8 @@ export const Header: React.FC<HeaderProps> = ({
   onNewProject,
   onOpenProjectModal,
   isSaving,
-  hasGeminiKey,
+  hasAiKey,
+  onOpenSettings,
 }) => {
   return (
     <header className="border-b border-zinc-800 bg-zinc-950 px-6 py-3.5 flex items-center justify-between sticky top-0 z-40">
@@ -88,11 +90,22 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="hidden lg:flex items-center gap-2 text-xs text-zinc-400 border border-zinc-800/80 px-2.5 py-1 rounded bg-zinc-900/60">
           <div
             className={`w-2 h-2 rounded-full ${
-              hasGeminiKey ? 'bg-emerald-400' : 'bg-amber-400'
+              hasAiKey ? 'bg-emerald-400' : 'bg-amber-400'
             }`}
           />
-          <span>{hasGeminiKey ? 'Gemini 3.8 Live Connected' : 'Demo / Free Mode'}</span>
+          <span>{hasAiKey ? 'AI provider ready' : 'Demo / key needed'}</span>
         </div>
+
+        <button
+          type="button"
+          onClick={onOpenSettings}
+          title="AI Settings"
+          aria-label="Open AI settings"
+          className="inline-flex items-center gap-1.5 rounded border border-zinc-700 px-2.5 py-1.5 text-xs text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-900 hover:text-zinc-100"
+        >
+          <Settings2 className="h-3.5 w-3.5" />
+          <span className="hidden sm:inline">AI Settings</span>
+        </button>
 
         {/* New Project Button */}
         <button

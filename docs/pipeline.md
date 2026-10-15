@@ -11,7 +11,7 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
 ---
 
 ## 02. Screenplay & Story Architecture (`script`)
-- **AI Model**: `gemini-3.8-flash`
+- **AI Model**: Selected text provider/model (Gemini or OpenAI).
 - **Output Schema**:
   - `title`: Polish working title.
   - `logline`: 1-2 sentence dramatic hook.
@@ -22,7 +22,7 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
 ---
 
 ## 03. World Bible & Visual Consistency (`bible`)
-- **AI Model**: `gemini-3.8-flash`
+- **AI Model**: Selected text provider/model (Gemini or OpenAI).
 - **Entities**:
   - **Characters**: Name, role, appearance, personality, wardrobe, and *visual prompt markers* (e.g. "East Asian woman, brass Kepler-9 patch, fingerless radio gloves").
   - **Locations**: Setting, architectural environment, visual characteristics, and lighting conditions.
@@ -32,7 +32,7 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
 ---
 
 ## 04. Scene Engine & Breakdown (`scenes`)
-- **AI Model**: `gemini-3.8-flash`
+- **AI Model**: Selected text provider/model (Gemini or OpenAI).
 - **Scene Fields**:
   - `sceneNumber`: Sequential order (1, 2, 3...)
   - `title`: Evocative scene title
@@ -51,7 +51,7 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
 ---
 
 ## 05. Visual Storyboard Studio (`storyboard`)
-- **AI Model**: `gemini-3.1-flash-lite-image`
+- **AI Model**: Gemini `gemini-2.5-flash-image` (Gemini provider required).
 - **States**:
   - `idle`: Pending visual generation.
   - `generating`: Active request with spinner and loading indicator.
@@ -62,7 +62,7 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
 ---
 
 ## 06. Voice Audio Studio (`audio`)
-- **AI Model**: `gemini-3.8-flash-lite-tts`
+- **AI Model**: Gemini `gemini-2.5-flash-preview-tts` (Gemini provider required).
 - **Voice Presets**: Kore, Puck, Charon, Fenrir, Zephyr.
 - **Audio Output**: Complete 24kHz 16-bit WAV file with RIFF header encoded as base64 data URI.
 - **Philosophy**: Audio is strictly non-blocking and optional. Projects can proceed to video assembly and export with or without synthesized audio.

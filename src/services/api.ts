@@ -19,6 +19,17 @@ import {
   Scene,
   ApiResponse,
 } from '../types';
+import { AiProvider, ModelOption, PROVIDER_MODELS, ThinkingLevel } from './aiProviders';
+
+export interface AiSettings {
+  provider: AiProvider;
+  model: string;
+  thinkingLevel: ThinkingLevel;
+  hasSavedKey: boolean;
+  keySource: 'session' | 'environment' | 'none';
+  maskedKey: string | null;
+  models: typeof PROVIDER_MODELS;
+}
 
 async function postJson<T>(endpoint: string, body: any): Promise<ApiResponse<T>> {
   try {
@@ -49,6 +60,7 @@ async function postJson<T>(endpoint: string, body: any): Promise<ApiResponse<T>>
 export async function checkServerHealth(): Promise<{
   status: string;
   hasGeminiKey: boolean;
+  hasAiKey?: boolean;
 }> {
   try {
     const res = await fetch('/api/health');
@@ -59,6 +71,46 @@ export async function checkServerHealth(): Promise<{
   } catch {
     return { status: 'offline', hasGeminiKey: false };
   }
+}
+
+export async function getAiSettings(): Promise<ApiResponse<AiSettings>> {
+  try {
+    const response = await fetch('/api/settings');
+    return await response.json();
+  } catch {
+    return { success: false, error: 'Could not reach server settings.' };
+  }
+}
+
+export async function getProviderModels(provider: AiProvider, apiKey?: string): Promise<ApiResponse<ModelOption[]>> {
+  try {
+    if (apiKey) return postJson<ModelOption[]>('/api/settings/models', { provider, apiKey });
+    const response = await fetch(`/api/settings/models?provider=${provider}`);
+    const data = await response.json();
+    return response.ok ? data : { success: false, error: data.error || 'Could not load provider models.' };
+  } catch {
+    return { success: false, error: 'Could not load provider models.' };
+  }
+}
+
+export async function saveAiSettings(settings: {
+  provider: AiProvider;
+  model: string;
+  thinkingLevel: ThinkingLevel;
+  apiKey?: string;
+}): Promise<ApiResponse<AiSettings>> {
+  return postJson<AiSettings>('/api/settings', settings);
+}
+
+export async function testAiSettings(settings: {
+  provider: AiProvider;
+  apiKey?: string;
+}): Promise<ApiResponse<{ valid: boolean }>> {
+  return postJson<{ valid: boolean }>('/api/settings/test', settings);
+}
+
+export async function removeAiKey(provider: AiProvider): Promise<ApiResponse<AiSettings>> {
+  return postJson<AiSettings>('/api/settings/key/remove', { provider });
 }
 
 export async function generateScriptApi(

@@ -56,9 +56,9 @@ graph TD
     end
 
     subgraph Gemini [Gemini AI Models]
-        AIService -->|Structured Screenplay & Extraction| Flash[gemini-3.8-flash]
-        AIService -->|Image Frame Generation| FlashImage[gemini-3.1-flash-lite-image]
-        AIService -->|Speech Synthesis| FlashTTS[gemini-3.8-flash-lite-tts]
+        AIService -->|Text: Gemini or OpenAI| Flash[Selected text model]
+        AIService -->|Image Frame Generation| FlashImage[gemini-2.5-flash-image]
+        AIService -->|Speech Synthesis| FlashTTS[gemini-2.5-flash-preview-tts]
     end
 
     VideoAssembler -->|Encodes Animatic| VideoBlob[(Playable WebM Video)]
@@ -86,10 +86,13 @@ graph TD
 
 - **Frontend**: React 19, TypeScript, Tailwind CSS, Lucide Icons, Vite
 - **Backend / Server**: Node.js, Express, tsx
-- **AI Models & SDK**: Official `@google/genai` TypeScript SDK
-  - **Text & Extraction**: `gemini-3.8-flash`
-  - **Image Generation**: `gemini-3.1-flash-lite-image`
-  - **Speech Synthesis**: `gemini-3.8-flash-lite-tts`
+- **AI Providers**: Gemini, OpenAI, Anthropic Messages, and Hugging Face OpenAI-compatible text adapters; official `@google/genai` SDK for Gemini media generation
+    - **Gemini text**: `gemini-2.5-flash`, `gemini-2.5-pro`
+    - **OpenAI text**: `gpt-4.1-mini`, `gpt-4.1`, `o4-mini`
+    - **Anthropic text**: Claude models from the authenticated model catalog
+    - **Hugging Face text**: Qwen models and other models available through the HF Inference router
+    - **Gemini image**: `gemini-2.5-flash-image`
+    - **Gemini speech**: `gemini-2.5-flash-preview-tts`
 - **Video Assembly**: HTML5 Canvas 2D, MediaStream Recording API (`MediaRecorder`), Web Audio API
 - **Testing**: Node.js Native Test Runner (`node:test`, `node:assert/strict`)
 
@@ -98,44 +101,37 @@ graph TD
 ## Getting Started
 
 ### Prerequisites
-- Node.js `v20.x` or higher (`v22.x` recommended)
-- npm `v10.x` or higher
+- Node.js `v20.x` or newer (`v22.x` recommended) and npm `v10.x` or newer.
 
-### Installation
+### Fastest Codespaces Startup
+The dev container installs the lockfile dependencies on creation and forwards port `3000`. In the Codespaces terminal, run:
 
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/Pradyut-S1n5h/AI-Content-Pipeline-Re-coded.git
-   cd AI-Content-Pipeline-Re-coded
-   ```
+```bash
+npm run dev
+```
 
-2. **Install dependencies**:
-   ```bash
-   npm install
-   ```
+Codespaces opens the forwarded app. The same process serves the Express API and Vite development UI; no second frontend process or proxy is needed. Readiness is available at `/api/health`.
 
-3. **Configure Environment Variables**:
-   Copy the example environment file:
-   ```bash
-   cp .env.example .env
-   ```
-   Open `.env` and set your Gemini API key:
-   ```env
-   GEMINI_API_KEY="your-gemini-api-key"
-   ```
-   *(Note: If you run without an API key, SceneCraft will automatically run in Demo Mode with the complete "The Last Signal" project pre-loaded).*
+### Local Startup
+Install the locked dependencies once, then run the single full-stack server:
 
-4. **Start the Development Server**:
-   ```bash
-   npm run dev
-   ```
-   Open your browser at `http://localhost:3000`.
+```bash
+npm ci
+npm run dev
+```
+
+Open `http://localhost:3000`. Without a key, the sample project and non-AI pipeline tools remain available in demo mode.
+
+### Configure AI
+Open **AI Settings** in the app header, choose Gemini, OpenAI, Anthropic, or Hugging Face, enter that provider's API key, and use **Test key** to verify provider access. Testing uses the provider's model-list endpoint; it does not generate content. Then save the provider, model, and thinking level. Qwen models are available through Hugging Face's inference router. Image and speech generation currently require Gemini; selecting another provider for text will not silently switch those requests.
+
+You may instead configure server environment variables for unattended/headless startup. Copy `.env.example` to `.env` and set the provider's matching key (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `HUGGINGFACE_API_KEY`/`HF_TOKEN`), optionally with `AI_PROVIDER`, `AI_MODEL`, and `PORT`. Environment keys are server-side defaults and are not returned to the browser.
 
 ---
 
 ## Running Tests & Verification
 
-SceneCraft includes automated tests covering data integrity, prompt construction, character consistency, schema validators, scene ordering, and export generation:
+Automated tests cover pipeline data and mocked provider requests, credentials, model compatibility, thinking settings, retries, and malformed responses:
 
 ```bash
 # Run unit test suite
@@ -154,10 +150,21 @@ npm run build
 
 | Variable | Required | Description |
 | :--- | :--- | :--- |
-| `GEMINI_API_KEY` | Optional | Google Gemini API key used on the server for live AI generation. If omitted, the app runs in Demo Mode. |
-| `PORT` | Optional | Port for the full-stack Express server (defaults to `3000`). |
+| `GEMINI_API_KEY` | Optional | Gemini server-side fallback key. |
+| `OPENAI_API_KEY` | Optional | OpenAI server-side fallback key. |
+| `ANTHROPIC_API_KEY` | Optional | Anthropic server-side fallback key. |
+| `HUGGINGFACE_API_KEY` / `HF_TOKEN` | Optional | Hugging Face server-side fallback token. |
+| `AI_PROVIDER` | Optional | Default provider: `gemini` or `openai` (defaults to `gemini`). |
+| `AI_MODEL` | Optional | Default text model, validated against the provider list. |
+| `PORT` | Optional | Full-stack server port (defaults to `3000`). |
 
-> **Security Note**: `GEMINI_API_KEY` is strictly accessed server-side in `server.ts`. It is never bundled into client-side JavaScript or sent to the browser.
+### Key Storage and Limits
+Keys entered in the webpage are held only in server memory, associated with an opaque `HttpOnly`, `SameSite=Strict` browser-session cookie. They are not persisted to disk, returned by any endpoint, included in a URL, logged, or written to project/browser storage. They are lost when the server restarts; re-enter them after restart. Environment variables are the persistent alternative and should be configured through Codespaces secrets or the deployment secret manager, never committed to `.env`.
+
+Generation settings also live in server memory for that browser session. The server caps a session at 10 AI requests per minute and 100 per day, limits text prompts to 100,000 characters, image prompts to 10,000 characters, audio input to 1,000 characters, and provider output to 8,192 tokens. These are guardrails, not a substitute for provider billing limits. AI generation can incur charges.
+
+### Provider and Thinking Support
+Gemini and Anthropic model selectors refresh against models enabled for the configured key; newer Gemini models (including `gemini-3.8-flash`) appear only if the provider catalog advertises them for that key. Hugging Face offers Qwen3 fallback models and refreshes from its inference router when available. Low, Medium, and High map to supported provider reasoning controls; unsupported models receive no reasoning parameter. The image and TTS pipeline stages are Gemini-only.
 
 ---
 
@@ -207,9 +214,11 @@ npm run build
 
 ## Known Limitations
 
-- **Image Generation Quota**: Live image generation requires a Gemini API key with access to `gemini-3.1-flash-lite-image`. A fallback sample art mode is provided for offline/demo use.
+- **Image Generation Quota**: Live image generation requires a Gemini API key with access to `gemini-2.5-flash-image`. A fallback sample art mode is provided for offline/demo use.
 - **Video Format**: Current in-browser video rendering exports WebM video files (`video/webm`). MP4 transcoding requires WebAssembly FFmpeg.
-- **Audio Models**: Multi-speaker backchanneling (`gemini-3.8-flash-tts`) is documented in architecture for future expansion; single-speaker narration is currently implemented with `gemini-3.8-flash-lite-tts`.
+- **Audio Models**: Multi-speaker backchanneling is not implemented; single-speaker narration uses `gemini-2.5-flash-preview-tts`.
+- **OpenAI Media**: OpenAI-compatible text generation is supported, but image and speech endpoints require Gemini and report this limitation without switching providers.
+- **Session Key Persistence**: Web-entered keys are intentionally memory-only and are lost on server restart. Configure environment secrets when durable server-side configuration is required.
 
 ---
 

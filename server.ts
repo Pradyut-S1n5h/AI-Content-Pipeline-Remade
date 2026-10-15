@@ -2,19 +2,31 @@
  * SceneCraft Full-Stack Express Server
  * 
  * Handles all AI interactions server-side using the official @google/genai SDK:
- * - Script generation & section rewrites (gemini-3.8-flash)
- * - World Bible character & location extraction (gemini-3.8-flash)
- * - Scene breakdown & cinematic visual prompts (gemini-3.8-flash)
- * - Image generation (gemini-3.1-flash-lite-image)
- * - Speech synthesis & dialogue audio (gemini-3.8-flash-lite-tts)
+ * - Provider/model-selectable text generation (Gemini and OpenAI)
+ * - Gemini image generation (gemini-2.5-flash-image)
+ * - Gemini speech synthesis (gemini-2.5-flash-preview-tts)
  * - Vite dev middleware mounting for seamless development
  */
 
-import express, { Request, Response } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createHash, randomUUID } from 'crypto';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
+import {
+  AiProvider,
+  AiProviderError,
+  GenerateTextOptions,
+  GEMINI_IMAGE_MODEL,
+  PROVIDER_MODELS,
+  ThinkingLevel,
+  generateText,
+  listProviderModels,
+  safeProviderError,
+  testProviderKey,
+  validateJsonSchema,
+  validateModel,
+} from './src/services/aiProviders';
 
 dotenv.config();
 
@@ -27,51 +39,287 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-// Shared Gemini client initialization
-const apiKey = process.env.GEMINI_API_KEY || '';
-const ai = apiKey
-  ? new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    })
-  : null;
+const sessions = new Map<string, {
+  provider?: AiProvider;
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
+  keys: Partial<Record<AiProvider, string>>;
+  availableModels: Partial<Record<AiProvider, { ids: string[]; keyDigest: string }>>;
+  generationTimes: number[];
+  lastUsed: number;
+}>();
+
+app.use((req: Request, res: Response, next) => {
+  const cookie = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='));
+  let sessionId = cookie?.slice('ai_session='.length);
+  if (!sessionId || !sessions.has(sessionId)) {
+    sessionId = randomUUID();
+    res.setHeader('Set-Cookie', `ai_session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
+    sessions.set(sessionId, { keys: {}, availableModels: {}, generationTimes: [], lastUsed: Date.now() });
+  }
+  const session = sessions.get(sessionId)!;
+  session.lastUsed = Date.now();
+  if (sessions.size > 500) {
+    for (const [id, value] of sessions) {
+      if (Date.now() - value.lastUsed > 86_400_000) sessions.delete(id);
+    }
+  }
+  next();
+});
+
+function getAiSettings(req: Request) {
+  const cookie = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='));
+  const sessionId = cookie?.slice('ai_session='.length);
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  const envProvider = isAiProvider(process.env.AI_PROVIDER) ? process.env.AI_PROVIDER : 'gemini';
+  const provider = session?.provider || envProvider;
+  const defaultModel = PROVIDER_MODELS[provider][0].id;
+  const envModel = process.env.AI_MODEL || defaultModel;
+  const model = session?.model || (validateModel(provider, envModel) ? envModel : defaultModel);
+  const key = session?.keys[provider] || getEnvironmentKey(provider);
+  const keySource = session?.keys[provider] ? 'session' : key ? 'environment' : 'none';
+  return {
+    provider,
+    model,
+    thinkingLevel: session?.thinkingLevel || 'medium',
+    key,
+    keySource,
+    publicSettings: {
+      provider,
+      model,
+      thinkingLevel: session?.thinkingLevel || 'medium',
+      hasSavedKey: Boolean(key),
+      keySource,
+      maskedKey: key ? '********' : null,
+      models: PROVIDER_MODELS,
+    },
+  };
+}
+
+function isAiProvider(value: unknown): value is AiProvider {
+  return value === 'gemini' || value === 'openai' || value === 'anthropic' || value === 'huggingface';
+}
+
+function getEnvironmentKey(provider: AiProvider): string {
+  const keys: Record<AiProvider, string | undefined> = {
+    gemini: process.env.GEMINI_API_KEY,
+    openai: process.env.OPENAI_API_KEY,
+    anthropic: process.env.ANTHROPIC_API_KEY,
+    huggingface: process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN,
+  };
+  return keys[provider] || '';
+}
+
+async function loadProviderModels(req: Request, provider: AiProvider, key: string) {
+  const models = key ? await listProviderModels(provider, key) : PROVIDER_MODELS[provider];
+  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  if (key && session) {
+    session.availableModels[provider] = {
+      ids: models.map((model) => model.id),
+      keyDigest: createHash('sha256').update(key).digest('hex'),
+    };
+  }
+  return models;
+}
+
+const Type = { OBJECT: 'OBJECT', ARRAY: 'ARRAY', STRING: 'STRING', INTEGER: 'INTEGER' } as const;
+
+function sendAiError(res: Response, error: unknown) {
+  const safeError = safeProviderError(error);
+  console.error(`[AI] ${safeError.code}`);
+  return res.status(safeError.status).json({ success: false, error: safeError.message });
+}
+
+function consumeGenerationBudget(req: Request) {
+  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  if (!session) throw new AiProviderError('AI session is unavailable. Refresh the page and try again.', 503, 'session_unavailable');
+  const now = Date.now();
+  session.generationTimes = session.generationTimes.filter((timestamp) => now - timestamp < 86_400_000);
+  if (session.generationTimes.length >= 100) {
+    throw new AiProviderError('This browser session has reached its daily generation limit. Try again tomorrow.', 429, 'quota_exceeded');
+  }
+  if (session.generationTimes.filter((timestamp) => now - timestamp < 60_000).length >= 10) {
+    throw new AiProviderError('This browser session is generating too quickly. Wait a minute before trying again.', 429, 'rate_limited');
+  }
+  session.generationTimes.push(now);
+}
+
+async function generateTextForRequest(
+  req: Request,
+  prompt: string,
+  options: Pick<GenerateTextOptions, 'systemInstruction' | 'responseSchema'> = {}
+) {
+  const settings = getAiSettings(req);
+  if (!settings.key) {
+    throw new AiProviderError(`Add a ${settings.provider} API key in Settings to enable AI generation.`, 503, 'missing_key');
+  }
+  consumeGenerationBudget(req);
+  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  const modelCache = session?.availableModels[settings.provider];
+  const allowedModels = modelCache?.keyDigest === createHash('sha256').update(settings.key).digest('hex')
+    ? modelCache.ids
+    : [];
+  return generateText({
+    provider: settings.provider,
+    apiKey: settings.key,
+    model: settings.model,
+    thinkingLevel: settings.thinkingLevel,
+    prompt,
+    allowedModels,
+    ...options,
+  });
+}
+
+function parseStructuredResponse(text: string, schema: Record<string, any>) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new AiProviderError('The model returned malformed JSON. Try again or choose a different model.', 502, 'malformed_json');
+  }
+  if (!validateJsonSchema(parsed, schema)) {
+    throw new AiProviderError('The model response did not match the required data structure. Try again.', 502, 'invalid_output');
+  }
+  return parsed;
+}
+
+async function getGeminiClient(req: Request) {
+  const settings = getAiSettings(req);
+  if (settings.provider !== 'gemini') {
+    throw new AiProviderError('Image and speech generation currently require Gemini. Select Gemini in Settings; no provider switch was made.', 400, 'unsupported_provider');
+  }
+  if (!settings.key) {
+    throw new AiProviderError('Add a Gemini API key in Settings to generate images or audio.', 503, 'missing_key');
+  }
+  consumeGenerationBudget(req);
+  const { GoogleGenAI } = await import('@google/genai');
+  return new GoogleGenAI({ apiKey: settings.key });
+}
 
 // ==========================================
 // 1. Health & Configuration Endpoint
 // ==========================================
 app.get('/api/health', (_req: Request, res: Response) => {
+  const settings = getAiSettings(_req);
+  const geminiKey = settings.provider === 'gemini' && Boolean(settings.key);
   res.json({
     status: 'ok',
-    hasGeminiKey: Boolean(apiKey && apiKey.length > 5),
-    mode: apiKey ? 'live' : 'demo_only',
-    message: apiKey
-      ? 'Gemini AI services are operational.'
-      : 'No GEMINI_API_KEY detected. Demo mode is fully enabled; add your key to enable live generation.',
+    hasGeminiKey: geminiKey,
+    hasAiKey: Boolean(settings.key),
+    provider: settings.provider,
+    model: settings.model,
+    mode: settings.key ? 'live' : 'demo_only',
+    message: settings.key ? 'AI provider is configured.' : 'Add an API key in Settings to enable live generation.',
   });
 });
 
-// Helper for checking AI client
-function ensureAiClient(res: Response) {
-  if (!ai || !apiKey) {
-    res.status(503).json({
-      success: false,
-      error: 'GEMINI_API_KEY is not configured on the server. Please add your key to the environment or explore the pre-loaded demo project.',
-    });
-    return false;
+app.get('/api/settings', (req: Request, res: Response) => {
+  res.json({ success: true, data: getAiSettings(req).publicSettings });
+});
+
+app.get('/api/settings/models', async (req: Request, res: Response) => {
+  const provider = req.query.provider || getAiSettings(req).provider;
+  if (!isAiProvider(provider)) {
+    return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
   }
-  return true;
-}
+  const current = getAiSettings(req);
+  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  const key = session?.keys[provider] || getEnvironmentKey(provider) ||
+    (current.provider === provider ? current.key : '');
+  try {
+    const models = await loadProviderModels(req, provider, key);
+    return res.json({ success: true, data: models });
+  } catch (error) {
+    return sendAiError(res, error);
+  }
+});
+
+app.post('/api/settings/models', async (req: Request, res: Response) => {
+  const { provider } = req.body || {};
+  if (!isAiProvider(provider)) {
+    return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
+  }
+  if (req.body.apiKey !== undefined && (typeof req.body.apiKey !== 'string' || req.body.apiKey.length > 1024)) {
+    return res.status(400).json({ success: false, error: 'The API key value is not valid.' });
+  }
+  const current = getAiSettings(req);
+  const key = typeof req.body.apiKey === 'string' && req.body.apiKey.trim()
+    ? req.body.apiKey.trim()
+    : current.provider === provider ? current.key : '';
+  try {
+    const models = await loadProviderModels(req, provider, key);
+    return res.json({ success: true, data: models });
+  } catch (error) {
+    return sendAiError(res, error);
+  }
+});
+
+app.post('/api/settings', (req: Request, res: Response) => {
+  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  const { provider, model, thinkingLevel, apiKey } = req.body || {};
+  if (!session || !isAiProvider(provider) ||
+    !['low', 'medium', 'high'].includes(thinkingLevel)) {
+    return res.status(400).json({ success: false, error: 'Choose a supported provider, model, and thinking level.' });
+  }
+  if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.length > 1024)) {
+    return res.status(400).json({ success: false, error: 'The API key value is not valid.' });
+  }
+  const selectedProvider = provider as AiProvider;
+  const selectedKey = typeof apiKey === 'string' && apiKey.trim()
+    ? apiKey.trim()
+    : session.keys[selectedProvider] ||
+      getEnvironmentKey(selectedProvider);
+  const modelCache = session.availableModels[selectedProvider];
+  const dynamicModelIsValid = modelCache?.keyDigest === createHash('sha256').update(selectedKey).digest('hex') &&
+    modelCache.ids.includes(model);
+  if (!validateModel(selectedProvider, model) && !dynamicModelIsValid) {
+    return res.status(400).json({ success: false, error: 'Refresh the provider model list and choose a model available to this key.' });
+  }
+  session.provider = provider;
+  session.model = model;
+  session.thinkingLevel = thinkingLevel;
+  if (typeof apiKey === 'string' && apiKey.trim()) session.keys[selectedProvider] = apiKey.trim();
+  return res.json({ success: true, data: getAiSettings(req).publicSettings });
+});
+
+app.post('/api/settings/test', async (req: Request, res: Response) => {
+  const { provider } = req.body || {};
+  if (!isAiProvider(provider)) {
+    return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
+  }
+  const active = getAiSettings(req);
+  const key = typeof req.body.apiKey === 'string' && req.body.apiKey.trim()
+    ? req.body.apiKey.trim()
+    : active.provider === provider ? active.key : '';
+  if (!key) return res.status(400).json({ success: false, error: `Enter a ${provider} API key to test.` });
+  try {
+    await testProviderKey(provider, key);
+    return res.json({ success: true, data: { valid: true } });
+  } catch (error) {
+    return sendAiError(res, error);
+  }
+});
+
+app.post('/api/settings/key/remove', (req: Request, res: Response) => {
+  const provider = req.body?.provider;
+  if (!isAiProvider(provider)) {
+    return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
+  }
+  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  if (session) delete session.keys[provider as AiProvider];
+  return res.json({ success: true, data: getAiSettings(req).publicSettings });
+});
 
 // ==========================================
-// 2. Script Generation (gemini-3.8-flash)
+// 2. Script Generation
 // ==========================================
 app.post('/api/ai/script', async (req: Request, res: Response) => {
-  if (!ensureAiClient(res)) return;
-
   try {
     const {
       title,
@@ -103,13 +351,7 @@ Format requirements:
 - Synopsis: Detailed 2-3 paragraph overview of the narrative arc and themes.
 - Full Script: Written in standard screenplay format with scene headings (INT./EXT.), character names, dialogue, and vivid action descriptions.`;
 
-    const response = await ai!.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: `Generate a complete structured script based on this idea: "${idea}". Existing working title: "${title || 'Untitled'}"`,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: {
+    const responseSchema = {
           type: Type.OBJECT,
           properties: {
             title: { type: Type.STRING, description: 'Final project title' },
@@ -119,27 +361,24 @@ Format requirements:
             targetAudienceNotes: { type: Type.STRING, description: 'Pacing and tone advice' },
           },
           required: ['title', 'logline', 'synopsis', 'fullScript'],
-        },
-      },
-    });
+        };
+    const response = await generateTextForRequest(
+      req,
+      `Generate a complete structured script based on this idea: "${idea}". Existing working title: "${title || 'Untitled'}"`,
+      { systemInstruction, responseSchema }
+    );
 
-    const parsed = JSON.parse(response.text?.trim() || '{}');
+    const parsed = parseStructuredResponse(response, responseSchema);
     return res.json({ success: true, data: parsed });
-  } catch (err: any) {
-    console.error('Error generating script:', err);
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to generate script with Gemini API.',
-    });
+  } catch (error) {
+    return sendAiError(res, error);
   }
 });
 
 // ==========================================
-// 3. Section Regeneration (gemini-3.8-flash)
+// 3. Section Regeneration
 // ==========================================
 app.post('/api/ai/regenerate-section', async (req: Request, res: Response) => {
-  if (!ensureAiClient(res)) return;
-
   try {
     const { sectionType, currentScript, projectIdea, instructions } = req.body;
 
@@ -154,108 +393,94 @@ User Specific Instructions for this rewrite: "${instructions || 'Make it more co
 
 Return ONLY the updated content for ${sectionType}. Do not destroy or include the rest of the script.`;
 
-    const response = await ai!.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-    });
+    const response = await generateTextForRequest(req, prompt);
 
     return res.json({
       success: true,
       data: {
         sectionType,
-        content: response.text?.trim() || '',
+        content: response,
       },
     });
-  } catch (err: any) {
-    console.error('Error regenerating section:', err);
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to regenerate script section.',
-    });
+  } catch (error) {
+    return sendAiError(res, error);
   }
 });
 
 // ==========================================
-// 4. World Bible Extraction (gemini-3.8-flash)
+// 4. World Bible Extraction
 // ==========================================
 app.post('/api/ai/bible', async (req: Request, res: Response) => {
-  if (!ensureAiClient(res)) return;
-
   try {
     const { script, title, contentType } = req.body;
 
-    const response = await ai!.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: `Extract the characters, key locations, and props from this screenplay to establish visual consistency:
+    const responseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        visualTheme: { type: Type.STRING, description: 'Overarching visual and cinematography aesthetic' },
+        characters: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              id: { type: Type.STRING },
+              name: { type: Type.STRING },
+              role: { type: Type.STRING, description: 'protagonist, antagonist, supporting, or narrator' },
+              description: { type: Type.STRING },
+              appearance: { type: Type.STRING, description: 'Physical visual characteristics' },
+              personality: { type: Type.STRING },
+              clothing: { type: Type.STRING, description: 'Wardrobe and garments' },
+              visualMarkers: { type: Type.STRING, description: 'Unique identifiers for image prompt consistency' },
+            },
+            required: ['name', 'appearance', 'clothing'],
+          },
+        },
+        locations: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              id: { type: Type.STRING },
+              name: { type: Type.STRING },
+              description: { type: Type.STRING },
+              environment: { type: Type.STRING },
+              visualCharacteristics: { type: Type.STRING },
+              timeAndLighting: { type: Type.STRING },
+            },
+            required: ['name', 'environment'],
+          },
+        },
+        props: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              id: { type: Type.STRING },
+              name: { type: Type.STRING },
+              description: { type: Type.STRING },
+              visualDetails: { type: Type.STRING },
+            },
+            required: ['name'],
+          },
+        },
+      },
+      required: ['visualTheme', 'characters', 'locations'],
+    };
+    const response = await generateTextForRequest(req, `Extract the characters, key locations, and props from this screenplay to establish visual consistency:
 Title: ${title}
 Content Type: ${contentType}
 
 Script text:
-${script}`,
-      config: {
-        systemInstruction: `You are an art director and production designer.
+${script}`, {
+      systemInstruction: `You are an art director and production designer.
 Analyze the script and extract:
 1. Characters: Include exact visual traits, age, ethnic appearance/build, wardrobe, and distinct visual markers (e.g. eye color, scars, badges, hair).
 2. Locations: Include setting, architectural vibe, lighting, weather, materials.
 3. Props: Key narrative objects with textures and colors.
 4. Visual Theme: Overarching aesthetic definition for image prompt generation.`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            visualTheme: { type: Type.STRING, description: 'Overarching visual and cinematography aesthetic' },
-            characters: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  name: { type: Type.STRING },
-                  role: { type: Type.STRING, description: 'protagonist, antagonist, supporting, or narrator' },
-                  description: { type: Type.STRING },
-                  appearance: { type: Type.STRING, description: 'Physical visual characteristics' },
-                  personality: { type: Type.STRING },
-                  clothing: { type: Type.STRING, description: 'Wardrobe and garments' },
-                  visualMarkers: { type: Type.STRING, description: 'Unique identifiers for image prompt consistency' },
-                },
-                required: ['name', 'appearance', 'clothing'],
-              },
-            },
-            locations: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  name: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  environment: { type: Type.STRING },
-                  visualCharacteristics: { type: Type.STRING },
-                  timeAndLighting: { type: Type.STRING },
-                },
-                required: ['name', 'environment'],
-              },
-            },
-            props: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  name: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  visualDetails: { type: Type.STRING },
-                },
-                required: ['name'],
-              },
-            },
-          },
-          required: ['visualTheme', 'characters', 'locations'],
-        },
-      },
     });
 
-    const parsed = JSON.parse(response.text?.trim() || '{}');
+    const parsed = parseStructuredResponse(response, responseSchema) as any;
     // Ensure ids
     if (parsed.characters) {
       parsed.characters = parsed.characters.map((c: any, i: number) => ({
@@ -277,21 +502,15 @@ Analyze the script and extract:
     }
 
     return res.json({ success: true, data: parsed });
-  } catch (err: any) {
-    console.error('Error extracting bible:', err);
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to extract world bible.',
-    });
+  } catch (error) {
+    return sendAiError(res, error);
   }
 });
 
 // ==========================================
-// 5. Scene Breakdown (gemini-3.8-flash)
+// 5. Scene Breakdown
 // ==========================================
 app.post('/api/ai/scenes', async (req: Request, res: Response) => {
-  if (!ensureAiClient(res)) return;
-
   try {
     const { script, title, contentType, durationMinutes, bible } = req.body;
 
@@ -301,9 +520,31 @@ Known Characters: ${(bible.characters || []).map((c: any) => `${c.name}: ${c.app
 Known Locations: ${(bible.locations || []).map((l: any) => `${l.name}: ${l.environment}`).join(' | ')}`
       : '';
 
-    const response = await ai!.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: `Break down this screenplay into a sequential list of structured storyboard scenes.
+    const responseSchema = {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          id: { type: Type.STRING },
+          sceneNumber: { type: Type.INTEGER },
+          title: { type: Type.STRING },
+          description: { type: Type.STRING },
+          setting: { type: Type.STRING },
+          timeOfDay: { type: Type.STRING },
+          characters: { type: Type.ARRAY, items: { type: Type.STRING } },
+          actions: { type: Type.STRING },
+          dialogue: { type: Type.STRING },
+          cameraDirection: { type: Type.STRING },
+          mood: { type: Type.STRING },
+          visualStyle: { type: Type.STRING },
+          durationSeconds: { type: Type.INTEGER },
+          imagePrompt: { type: Type.STRING },
+          videoPrompt: { type: Type.STRING },
+        },
+        required: ['sceneNumber', 'title', 'description', 'setting', 'cameraDirection', 'durationSeconds', 'imagePrompt'],
+      },
+    };
+    const response = await generateTextForRequest(req, `Break down this screenplay into a sequential list of structured storyboard scenes.
 Title: ${title}
 Content Type: ${contentType}
 Target Duration: ${durationMinutes || 3} minutes
@@ -311,9 +552,8 @@ Target Duration: ${durationMinutes || 3} minutes
 ${bibleContext ? `World Bible Context for Visual Consistency:\n${bibleContext}\n` : ''}
 
 Screenplay:
-${script}`,
-      config: {
-        systemInstruction: `You are an experienced film director and storyboard artist.
+${script}`, {
+  systemInstruction: `You are an experienced film director and storyboard artist.
 Break down the screenplay into between 4 and 8 key visual scenes.
 For each scene, formulate:
 1. sceneNumber: 1, 2, 3...
@@ -330,46 +570,10 @@ For each scene, formulate:
 12. durationSeconds: Integer 3 to 12
 13. imagePrompt: A masterclass text prompt for image generation that integrates the character appearance, clothing, environment, camera lens, and lighting.
 14. videoPrompt: A prompt for motion/video cameras.`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              id: { type: Type.STRING },
-              sceneNumber: { type: Type.INTEGER },
-              title: { type: Type.STRING },
-              description: { type: Type.STRING },
-              setting: { type: Type.STRING },
-              timeOfDay: { type: Type.STRING },
-              characters: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-              actions: { type: Type.STRING },
-              dialogue: { type: Type.STRING },
-              cameraDirection: { type: Type.STRING },
-              mood: { type: Type.STRING },
-              visualStyle: { type: Type.STRING },
-              durationSeconds: { type: Type.INTEGER },
-              imagePrompt: { type: Type.STRING },
-              videoPrompt: { type: Type.STRING },
-            },
-            required: [
-              'sceneNumber',
-              'title',
-              'description',
-              'setting',
-              'cameraDirection',
-              'durationSeconds',
-              'imagePrompt',
-            ],
-          },
-        },
-      },
+      responseSchema,
     });
 
-    const parsed = JSON.parse(response.text?.trim() || '[]');
+    const parsed = parseStructuredResponse(response, responseSchema) as any[];
     const scenesWithIds = parsed.map((s: any, idx: number) => ({
       ...s,
       id: s.id || `scene-${idx + 1}-${Date.now()}`,
@@ -380,21 +584,15 @@ For each scene, formulate:
     }));
 
     return res.json({ success: true, data: scenesWithIds });
-  } catch (err: any) {
-    console.error('Error generating scenes:', err);
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to breakdown scenes.',
-    });
+  } catch (error) {
+    return sendAiError(res, error);
   }
 });
 
 // ==========================================
-// 6. Visual Prompt Regeneration (gemini-3.8-flash)
+// 6. Visual Prompt Regeneration
 // ==========================================
 app.post('/api/ai/visual-prompts', async (req: Request, res: Response) => {
-  if (!ensureAiClient(res)) return;
-
   try {
     const { scene, bible, visualStyle } = req.body;
 
@@ -413,44 +611,46 @@ Locations: ${(bible?.locations || []).map((l: any) => `${l.name}: environment=${
 
 Return ONLY the final detailed image prompt. Do not wrap in quotes or formatting.`;
 
-    const response = await ai!.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-    });
+    const response = await generateTextForRequest(req, prompt);
 
     return res.json({
       success: true,
-      data: { prompt: response.text?.trim() || scene.imagePrompt },
+      data: { prompt: response.trim() || scene.imagePrompt },
     });
-  } catch (err: any) {
-    console.error('Error generating prompt:', err);
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to generate visual prompt.',
-    });
+  } catch (error) {
+    return sendAiError(res, error);
   }
 });
 
 // ==========================================
-// 7. Image Generation (gemini-3.1-flash-lite-image)
+// 7. Image Generation (Gemini only)
 // ==========================================
 app.post('/api/ai/generate-image', async (req: Request, res: Response) => {
-  if (!ensureAiClient(res)) return;
-
   try {
     const { prompt, aspectRatio = '16:9' } = req.body;
 
     if (!prompt) {
       return res.status(400).json({ success: false, error: 'Prompt is required for image generation.' });
     }
+    if (typeof prompt !== 'string') {
+      return res.status(400).json({ success: false, error: 'Image prompt must be text.' });
+    }
+    if (prompt.length > 10_000) {
+      return res.status(413).json({ success: false, error: 'Image prompts must be 10,000 characters or fewer.' });
+    }
+    if (!['16:9', '9:16', '1:1', '4:3'].includes(aspectRatio)) {
+      return res.status(400).json({ success: false, error: 'Choose a supported image aspect ratio.' });
+    }
 
-    // Call gemini-3.1-flash-lite-image
-    const response = await ai!.models.generateContent({
-      model: 'gemini-3.1-flash-lite-image',
+    // Image generation remains tied to Gemini; the text model selector does not affect it.
+    const ai = await getGeminiClient(req);
+    const response = await ai.models.generateContent({
+      model: GEMINI_IMAGE_MODEL,
       contents: {
         parts: [{ text: prompt }],
       },
       config: {
+        responseModalities: ['IMAGE'],
         imageConfig: {
           aspectRatio: aspectRatio as any,
         },
@@ -458,10 +658,12 @@ app.post('/api/ai/generate-image', async (req: Request, res: Response) => {
     });
 
     let imageUrl: string | null = null;
+    let imageMimeType = 'image/png';
     const parts = response.candidates?.[0]?.content?.parts || [];
     for (const part of parts) {
       if (part.inlineData && part.inlineData.data) {
-        imageUrl = `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
+        imageMimeType = part.inlineData.mimeType || imageMimeType;
+        imageUrl = `data:${imageMimeType};base64,${part.inlineData.data}`;
         break;
       }
     }
@@ -477,39 +679,37 @@ app.post('/api/ai/generate-image', async (req: Request, res: Response) => {
       success: true,
       data: {
         imageUrl,
-        mimeType: 'image/png',
+        mimeType: imageMimeType,
       },
     });
-  } catch (err: any) {
-    console.error('Error generating image:', err);
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to generate image with Gemini model.',
-    });
+  } catch (error) {
+    return sendAiError(res, error);
   }
 });
 
 // ==========================================
-// 8. Audio Speech Synthesis (gemini-3.8-flash-lite-tts)
+// 8. Audio Speech Synthesis (Gemini only)
 // ==========================================
 app.post('/api/ai/audio-tts', async (req: Request, res: Response) => {
-  if (!ensureAiClient(res)) return;
-
   try {
     const { text, voice = 'Kore', speakerRole } = req.body;
 
-    if (!text || text.trim().length === 0) {
+    if (typeof text !== 'string' || text.trim().length === 0) {
       return res.status(400).json({ success: false, error: 'Text is required for TTS synthesis.' });
     }
+    if (text.length > 1000) {
+      return res.status(413).json({ success: false, error: 'Audio text must be 1,000 characters or fewer.' });
+    }
 
-    const response = await ai!.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
+    const ai = await getGeminiClient(req);
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-preview-tts',
       contents: [
         {
           role: 'user',
           parts: [
             {
-              text: text.slice(0, 1000), // safe length
+              text,
               speechMetadata: {
                 style: speakerRole ? `Dramatic narration, role: ${speakerRole}` : 'Clear cinematic narration',
               },
@@ -545,13 +745,22 @@ app.post('/api/ai/audio-tts', async (req: Request, res: Response) => {
         duration: Math.max(2, Math.round(text.split(' ').length / 2.5)),
       },
     });
-  } catch (err: any) {
-    console.error('Error synthesizing audio:', err);
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to synthesize audio with Gemini TTS.',
-    });
+  } catch (error) {
+    return sendAiError(res, error);
   }
+});
+
+app.use((error: any, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) return next(error);
+  const status = error?.type === 'entity.parse.failed' ? 400
+    : error?.type === 'entity.too.large' ? 413 : 500;
+  console.error(`[HTTP] ${status}`);
+  return res.status(status).json({
+    success: false,
+    error: status === 400 ? 'Request body must contain valid JSON.'
+      : status === 413 ? 'Request body is too large.'
+        : 'The server could not process this request.',
+  });
 });
 
 // ==========================================

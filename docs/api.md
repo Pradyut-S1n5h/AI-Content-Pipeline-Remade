@@ -1,30 +1,53 @@
 # SceneCraft API Reference
 
-All AI operations in SceneCraft are handled via backend Express endpoints in `server.ts`. This ensures that API credentials (`GEMINI_API_KEY`) remain strictly server-side.
+All AI operations in SceneCraft are handled by backend Express endpoints in `server.ts`. Text generation supports Gemini, OpenAI, Anthropic, and Hugging Face. Web-entered credentials remain in server memory and are associated with an `HttpOnly` browser-session cookie. Keys are never returned by API endpoints.
 
 ---
 
 ## Health & System Status
 
 ### `GET /api/health`
-Returns the status of the server and whether a Gemini API key is configured.
+Returns server readiness and whether the active browser session's selected provider is configured.
 
 **Response**:
 ```json
 {
   "status": "ok",
-  "hasGeminiKey": true,
+  "hasGeminiKey": false,
+  "hasAiKey": true,
+  "provider": "openai",
+  "model": "gpt-4.1-mini",
   "mode": "live",
-  "message": "Gemini AI services are operational."
+  "message": "AI provider is configured."
 }
 ```
+
+### `GET /api/settings`
+Returns the selected provider, model, thinking level, supported model lists, and whether a key is configured. The key value is never returned; `maskedKey` is a fixed mask only.
+
+### `GET /api/settings/models?provider=gemini`
+Fetches Gemini models available to the current server-side key and returns only models advertising `generateContent`. Newer text models are therefore selectable when enabled for the key. Without a key, the maintained known model list is returned. Unknown models do not receive a thinking parameter unless support is explicitly configured.
+
+### `POST /api/settings`
+Saves session-scoped settings. Accepts `provider` (`gemini`, `openai`, `anthropic`, or `huggingface`), a compatible `model`, `thinkingLevel` (`low`, `medium`, or `high`), and an optional `apiKey`. A key is held in server memory only.
+
+### `POST /api/settings/test`
+Checks credentials with the provider's model-list endpoint using `GET`; it does not generate content or incur generation charges. An optional `apiKey` can be tested before saving.
+
+### `GET /api/settings/models?provider=gemini`
+Lists provider text models enabled for the active key. Use `POST /api/settings/models` with `{ "provider": "gemini", "apiKey": "..." }` to refresh with an unsaved key; credentials are sent in the request body, never the URL or response. Gemini results filter out image, audio, embedding, and other non-text models. Models such as `gemini-3.8-flash` appear only if the provider lists them for that key. Hugging Face includes Qwen models through its OpenAI-compatible router.
+
+### `POST /api/settings/key/remove`
+Removes the selected provider's key from the current server session. Environment-configured keys are not removed.
+
+Web-entered keys/settings are lost on server restart. Generation is capped at 10 requests per minute and 100 per day per session.
 
 ---
 
 ## Screenplay & Narrative Endpoints
 
 ### `POST /api/ai/script`
-Generates a structured screenplay from project metadata using `gemini-3.8-flash`.
+Generates a structured screenplay from project metadata using the selected text provider and compatible model.
 
 **Request Body**:
 ```json
@@ -85,7 +108,7 @@ Rewrites only a specific section of the screenplay without destroying the rest.
 ## World Bible & Entity Extraction
 
 ### `POST /api/ai/bible`
-Extracts characters, recurring locations, and props from screenplay text using `gemini-3.8-flash`.
+Extracts characters, recurring locations, and props from screenplay text using the selected text provider and compatible model.
 
 **Request Body**:
 ```json
@@ -182,7 +205,7 @@ Re-synthesizes an ultra-detailed image prompt for an individual scene using the 
 ## Media Generation Endpoints
 
 ### `POST /api/ai/generate-image`
-Generates a storyboard scene image using `gemini-3.1-flash-lite-image`.
+Generates a storyboard scene image using Gemini `gemini-2.5-flash-image` with image output explicitly requested. This media model is separate from the text-model selector. Image generation is not available through the OpenAI provider selection.
 
 **Request Body**:
 ```json
@@ -206,7 +229,7 @@ Generates a storyboard scene image using `gemini-3.1-flash-lite-image`.
 ---
 
 ### `POST /api/ai/audio-tts`
-Synthesizes speech audio for character dialogue or scene narration using `gemini-3.8-flash-lite-tts`.
+Synthesizes speech audio for character dialogue or scene narration using Gemini `gemini-2.5-flash-preview-tts`. Speech generation is not available through the OpenAI provider selection.
 
 **Request Body**:
 ```json
