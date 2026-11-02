@@ -32,6 +32,7 @@ export interface Character {
   personality: string;
   clothing: string;
   visualMarkers: string; // e.g. "scar across left eyebrow, glowing neon cyan visor"
+  referenceImages?: string[];
 }
 
 export interface Location {
@@ -41,6 +42,7 @@ export interface Location {
   environment: string; // e.g. "Cyberpunk alleyway, rain-slicked asphalt, flickering neon billboards"
   visualCharacteristics: string;
   timeAndLighting: string;
+  referenceImages?: string[];
 }
 
 export interface Prop {
@@ -82,6 +84,8 @@ export interface Scene {
   audioDuration?: number;
 }
 
+export type SceneUpdate = Scene[] | ((currentScenes: Scene[]) => Scene[]);
+
 export interface ScriptSection {
   title: string;
   logline: string;
@@ -89,6 +93,14 @@ export interface ScriptSection {
   fullScript: string;
   targetAudienceNotes?: string;
 }
+
+export interface ScriptVersion {
+  script: ScriptSection;
+  savedAt: string;
+  label: string;
+}
+
+export type ScriptUpdate = ScriptSection | ((currentScript: ScriptSection) => ScriptSection);
 
 export interface ProjectMetadata {
   id: string;
@@ -111,9 +123,13 @@ export interface Project {
   script: ScriptSection;
   bible: WorldBible;
   scenes: Scene[];
+  scriptHistory?: ScriptVersion[];
+  scriptHistoryIndex?: number;
   currentStage: PipelineStage;
   completedStages: PipelineStage[];
   assembledVideoUrl?: string;
+  assembledVideoAssetId?: string;
+  assembledVideoDataUrl?: string;
 }
 
 export interface ScriptGenerationRequest {
@@ -158,11 +174,12 @@ export interface ImageGenerationRequest {
   prompt: string;
   aspectRatio?: '16:9' | '9:16' | '1:1' | '4:3';
   sceneId?: string;
+  referenceImages?: string[];
 }
 
 export interface AudioTTSRequest {
   text: string;
-  voice?: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
+  voice?: string;
   speakerRole?: string;
 }
 

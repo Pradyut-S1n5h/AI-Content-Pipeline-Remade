@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
-import { Project, Scene } from '../../types';
+import React, { useEffect, useRef, useState } from 'react';
+import { Project, Scene, SceneUpdate } from '../../types';
 import { generateAudioTTSApi } from '../../services/api';
+import { AiProvider, PROVIDER_CAPABILITIES } from '../../services/aiProviders';
 import {
   Mic,
   Play,
@@ -17,9 +18,10 @@ import {
 
 interface AudioStageProps {
   project: Project;
-  onUpdateScenes: (scenes: Scene[]) => void;
+  onUpdateScenes: (update: SceneUpdate) => void;
   onProceedToVideo: () => void;
   hasGeminiKey: boolean;
+  activeProvider: AiProvider;
 }
 
 export const AudioStage: React.FC<AudioStageProps> = ({
@@ -27,39 +29,81 @@ export const AudioStage: React.FC<AudioStageProps> = ({
   onUpdateScenes,
   onProceedToVideo,
   hasGeminiKey,
+  activeProvider,
 }) => {
-  const [selectedVoice, setSelectedVoice] = useState<'Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr'>('Kore');
+  const [selectedVoice, setSelectedVoice] = useState('Kore');
   const [activePlayingId, setActivePlayingId] = useState<string | null>(null);
   const [currentAudioElement, setCurrentAudioElement] = useState<HTMLAudioElement | null>(null);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const [isSynthesizingForId, setIsSynthesizingForId] = useState<string | null>(null);
   const [isBatchSynthesizing, setIsBatchSynthesizing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const scenes = project.scenes || [];
+  const speechGenerationSupported = PROVIDER_CAPABILITIES[activeProvider].speech;
+  const voices = activeProvider === 'openai'
+    ? ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'onyx', 'nova', 'sage', 'shimmer', 'verse', 'marin', 'cedar']
+    : activeProvider === 'gemini' ? ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'] : [];
+
+  useEffect(() => {
+    setSelectedVoice(activeProvider === 'openai' ? 'alloy' : 'Kore');
+  }, [activeProvider]);
+
+  const stopCurrentAudio = () => {
+    const audio = currentAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.onended = null;
+      audio.onerror = null;
+      audio.removeAttribute('src');
+      audio.load();
+      currentAudioRef.current = null;
+    }
+    setCurrentAudioElement(null);
+    setActivePlayingId(null);
+  };
+
+  useEffect(() => () => {
+    const audio = currentAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      currentAudioRef.current = null;
+    }
+  }, []);
 
   const handlePlayAudio = (sceneId: string, audioUrl: string) => {
     if (activePlayingId === sceneId && currentAudioElement) {
-      currentAudioElement.pause();
-      setActivePlayingId(null);
+      stopCurrentAudio();
       return;
     }
 
-    if (currentAudioElement) {
-      currentAudioElement.pause();
-    }
+    stopCurrentAudio();
 
     const audio = new Audio(audioUrl);
-    audio.onended = () => setActivePlayingId(null);
-    audio.onerror = () => {
-      setActivePlayingId(null);
-      setErrorMessage('Audio playback error.');
+    currentAudioRef.current = audio;
+    audio.onended = () => {
+      if (currentAudioRef.current === audio) stopCurrentAudio();
     };
-    audio.play();
+    audio.onerror = () => {
+      if (currentAudioRef.current === audio) {
+        stopCurrentAudio();
+        setErrorMessage('Audio playback error.');
+      }
+    };
     setCurrentAudioElement(audio);
     setActivePlayingId(sceneId);
+    audio.play().catch(() => {
+      if (currentAudioRef.current === audio) {
+        stopCurrentAudio();
+        setErrorMessage('Audio could not be played by this browser.');
+      }
+    });
   };
 
   const handleSynthesizeScene = async (sceneId: string) => {
+    if (!speechGenerationSupported) return;
     const scene = scenes.find((s) => s.id === sceneId);
     if (!scene) return;
 
@@ -80,41 +124,39 @@ export const AudioStage: React.FC<AudioStageProps> = ({
     setIsSynthesizingForId(null);
 
     if (res.success && res.data?.audioUrl) {
-      const updated = scenes.map((s) =>
-        s.id === sceneId
+      onUpdateScenes((current) => current.map((scene) =>
+        scene.id === sceneId
           ? {
-              ...s,
+              ...scene,
               audioUrl: res.data!.audioUrl,
-              audioStatus: 'completed' as const,
+              audioStatus: 'completed',
               audioDuration: res.data!.duration,
               audioError: undefined,
             }
-          : s
-      );
-      onUpdateScenes(updated);
+          : scene
+      ));
     } else {
-      const failed = scenes.map((s) =>
-        s.id === sceneId
-          ? {
-              ...s,
-              audioStatus: 'failed' as const,
-              audioError: res.error || 'TTS synthesis failed.',
-            }
-          : s
-      );
-      onUpdateScenes(failed);
+      onUpdateScenes((current) => current.map((scene) =>
+        scene.id === sceneId
+          ? { ...scene, audioStatus: 'failed', audioError: res.error || 'TTS synthesis failed.' }
+          : scene
+      ));
       setErrorMessage(res.error || 'Failed to synthesize speech.');
     }
   };
 
   const handleBatchSynthesize = async () => {
+    if (!speechGenerationSupported) return;
     setIsBatchSynthesizing(true);
-    for (const scene of scenes) {
-      if (!scene.audioUrl) {
-        await handleSynthesizeScene(scene.id);
+    try {
+      for (const scene of scenes) {
+        if (!scene.audioUrl && scene.audioStatus !== 'generating') {
+          await handleSynthesizeScene(scene.id);
+        }
       }
+    } finally {
+      setIsBatchSynthesizing(false);
     }
-    setIsBatchSynthesizing(false);
   };
 
   const handleDownloadAudio = (scene: Scene) => {
@@ -138,14 +180,14 @@ export const AudioStage: React.FC<AudioStageProps> = ({
             <span>Voice & Audio Studio (Optional)</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Generate voiceover and dialogue audio clips with Gemini 3.8 Flash Lite TTS.
+            Generate voiceover and dialogue audio with the selected provider: {activeProvider === 'openai' ? 'OpenAI TTS' : activeProvider === 'gemini' ? 'Gemini TTS' : 'speech generation unavailable'}.
           </p>
         </div>
 
         <div className="flex items-center gap-2.5">
           <button
             onClick={handleBatchSynthesize}
-            disabled={isBatchSynthesizing || scenes.length === 0}
+            disabled={!speechGenerationSupported || isBatchSynthesizing || Boolean(isSynthesizingForId) || scenes.length === 0}
             className="flex items-center gap-2 bg-amber-400 hover:bg-amber-300 disabled:opacity-50 text-zinc-950 font-semibold px-4 py-2 rounded text-xs transition-colors"
           >
             {isBatchSynthesizing ? (
@@ -190,16 +232,18 @@ export const AudioStage: React.FC<AudioStageProps> = ({
           <label className="text-zinc-400 text-xs">TTS Voice:</label>
           <select
             value={selectedVoice}
-            onChange={(e) => setSelectedVoice(e.target.value as any)}
+            onChange={(e) => setSelectedVoice(e.target.value)}
+            disabled={!speechGenerationSupported}
             className="bg-zinc-950 border border-zinc-800 text-zinc-200 rounded px-2.5 py-1 text-xs focus:outline-none focus:border-amber-400"
           >
-            <option value="Kore">Kore (Balanced, Articulate)</option>
-            <option value="Puck">Puck (Expressive, Dynamic)</option>
-            <option value="Charon">Charon (Deep, Resonant)</option>
-            <option value="Fenrir">Fenrir (Authoritative, Gritty)</option>
-            <option value="Zephyr">Zephyr (Warm, Natural)</option>
+            {voices.map((voice) => <option key={voice} value={voice}>{voice}</option>)}
           </select>
         </div>
+        {!speechGenerationSupported && (
+          <div role="status" className="rounded border border-amber-900/70 bg-amber-950/30 px-4 py-3 text-xs text-amber-200">
+            {activeProvider} does not provide speech synthesis in SceneCraft. Choose Gemini or OpenAI in AI Settings. Existing audio can still be played and downloaded.
+          </div>
+        )}
       </div>
 
       {/* Error alert */}
@@ -252,6 +296,11 @@ export const AudioStage: React.FC<AudioStageProps> = ({
                 <p className="text-xs text-zinc-300 font-mono italic bg-zinc-950/70 p-2 rounded border border-zinc-800/80">
                   "{voiceSnippet}"
                 </p>
+                {scene.audioError && (
+                  <p role="alert" className="text-[11px] leading-relaxed text-rose-300">
+                    Audio generation failed; previous audio is retained. {scene.audioError}
+                  </p>
+                )}
               </div>
 
               {/* Action Buttons */}
@@ -289,7 +338,7 @@ export const AudioStage: React.FC<AudioStageProps> = ({
 
                     <button
                       onClick={() => handleSynthesizeScene(scene.id)}
-                      disabled={isSynthesizing}
+                      disabled={isSynthesizing || !speechGenerationSupported}
                       className="p-2 text-zinc-500 hover:text-amber-400 bg-zinc-950 border border-zinc-800 rounded transition-colors"
                       title="Re-synthesize audio"
                     >
@@ -299,7 +348,7 @@ export const AudioStage: React.FC<AudioStageProps> = ({
                 ) : (
                   <button
                     onClick={() => handleSynthesizeScene(scene.id)}
-                    disabled={isSynthesizing}
+                    disabled={isSynthesizing || !speechGenerationSupported}
                     className="flex items-center gap-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 px-3 py-1.5 rounded text-xs transition-colors"
                   >
                     {isSynthesizing ? (

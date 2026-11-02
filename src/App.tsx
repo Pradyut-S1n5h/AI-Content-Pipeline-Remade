@@ -6,6 +6,8 @@ import {
   ScriptSection,
   WorldBible,
   Scene,
+  SceneUpdate,
+  ScriptUpdate,
 } from './types';
 import {
   loadProjectLocal,
@@ -15,9 +17,13 @@ import {
   createNewBlankProject,
   getActiveProjectId,
   setActiveProjectId,
+  saveProjectVideo,
+  deleteProjectVideo,
 } from './services/storage';
 import { checkServerHealth } from './services/api';
 import { DEMO_PROJECT_SIGNAL } from './utils/sampleData';
+import { AiProvider } from './services/aiProviders';
+import { appendScriptVersion, restoreScriptVersion } from './utils/scriptHistory';
 
 import { Header } from './components/Header';
 import { PipelineNav } from './components/PipelineNav';
@@ -33,20 +39,17 @@ import { VideoStage } from './components/stages/VideoStage';
 import { ExportStage } from './components/stages/ExportStage';
 
 export default function App() {
-  const [project, setProject] = useState<Project>(() => {
-    const activeId = getActiveProjectId();
-    if (activeId) {
-      const stored = loadProjectLocal(activeId);
-      if (stored) return stored;
-    }
-    return DEMO_PROJECT_SIGNAL;
-  });
+  const [project, setProject] = useState<Project>(DEMO_PROJECT_SIGNAL);
 
   const [allProjects, setAllProjects] = useState<ProjectMetadata[]>([]);
-  const [currentStage, setCurrentStage] = useState<PipelineStage>('project');
-  const [isSaving, setIsSaving] = useState(false);
+  const [currentStage, setCurrentStage] = useState<PipelineStage>(() => project.currentStage);
+  const [projectReady, setProjectReady] = useState(false);
+  const [projectRecoveryFailed, setProjectRecoveryFailed] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<'saving' | 'saved' | 'unsaved' | 'failed'>('saved');
+  const [saveError, setSaveError] = useState('');
   const [hasGeminiKey, setHasGeminiKey] = useState(false);
   const [hasAiKey, setHasAiKey] = useState(false);
+  const [activeProvider, setActiveProvider] = useState<AiProvider>('gemini');
 
   // Modals
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
@@ -55,33 +58,103 @@ export default function App() {
 
   // Initial load
   useEffect(() => {
-    // 1. Sync project list
-    const list = listAllProjects();
-    setAllProjects(list);
+    let cancelled = false;
+    const restoreProjects = async () => {
+      try {
+        const activeId = getActiveProjectId();
+        const restored = activeId ? await loadProjectLocal(activeId) : null;
+        if (cancelled) return;
+        if (restored) {
+          setProject(restored);
+          setCurrentStage(restored.currentStage);
+        }
+        setAllProjects(await listAllProjects());
+        if (!cancelled) setProjectReady(true);
+      } catch (error) {
+        if (!cancelled) {
+          setSaveError(error instanceof Error ? error.message : 'Project recovery failed.');
+          setSaveStatus('failed');
+          setProjectRecoveryFailed(true);
+          setProjectReady(true);
+        }
+      }
+    };
+    void restoreProjects();
 
-    // 2. Health check
     checkServerHealth().then((res) => {
       setHasGeminiKey(res.hasGeminiKey);
       setHasAiKey(Boolean(res.hasAiKey));
+      if (res.provider) setActiveProvider(res.provider);
     });
+    return () => { cancelled = true; };
   }, []);
 
   // Autosave whenever project changes (debounced)
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveSequenceRef = useRef(0);
   useEffect(() => {
-    setIsSaving(true);
+    if (!projectReady || projectRecoveryFailed) return;
+    setSaveStatus('unsaved');
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
 
     saveTimeoutRef.current = setTimeout(() => {
-      saveProjectLocal(project);
-      setAllProjects(listAllProjects());
-      setIsSaving(false);
+      setSaveStatus('saving');
+      const sequence = ++saveSequenceRef.current;
+      void (async () => {
+        try {
+          await saveProjectLocal(project);
+          const projects = await listAllProjects();
+          if (sequence !== saveSequenceRef.current) return;
+          setAllProjects(projects);
+          setSaveError('');
+          setSaveStatus('saved');
+        } catch (error) {
+          if (sequence !== saveSequenceRef.current) return;
+          setSaveError(error instanceof Error ? error.message : 'Project save failed.');
+          setSaveStatus('failed');
+        }
+      })();
     }, 600);
 
     return () => {
       if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     };
-  }, [project]);
+  }, [project, projectReady, projectRecoveryFailed]);
+
+  const handleSaveNow = async () => {
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    const sequence = ++saveSequenceRef.current;
+    setSaveStatus('saving');
+    try {
+      await saveProjectLocal(project);
+      const projects = await listAllProjects();
+      if (sequence !== saveSequenceRef.current) return;
+      setAllProjects(projects);
+      setSaveError('');
+      setSaveStatus('saved');
+    } catch (error) {
+      if (sequence !== saveSequenceRef.current) return;
+      setSaveError(error instanceof Error ? error.message : 'Project save failed.');
+      setSaveStatus('failed');
+    }
+  };
+
+  const projectRef = useRef(project);
+  projectRef.current = project;
+  useEffect(() => {
+    const saveBeforePageExit = () => {
+      void saveProjectLocal(projectRef.current).catch((error: unknown) => {
+        console.error('Final project save failed:', error);
+      });
+    };
+    window.addEventListener('pagehide', saveBeforePageExit);
+    return () => window.removeEventListener('pagehide', saveBeforePageExit);
+  }, []);
+
+  const navigateToStage = (stage: PipelineStage) => {
+    setCurrentStage(stage);
+    setProject((prev) => ({ ...prev, currentStage: stage }));
+  };
 
   // Stage completion tracker helper
   const markStageCompleted = (stage: PipelineStage) => {
@@ -94,21 +167,39 @@ export default function App() {
   };
 
   // Handlers for stage updates
-  const handleUpdateScript = (script: ScriptSection) => {
+  const handleUpdateScript = (projectId: string, update: ScriptUpdate, label = 'Edit') => {
     setProject((prev) => {
+      if (prev.metadata.id !== projectId) return prev;
+      const script = typeof update === 'function' ? update(prev.script) : update;
+      if (JSON.stringify(script) === JSON.stringify(prev.script)) return prev;
+      const history = appendScriptVersion(prev, script, label);
       const completed: PipelineStage[] = prev.completedStages.includes('script')
         ? prev.completedStages
         : [...prev.completedStages, 'script'];
       return {
         ...prev,
         script,
+        ...history,
         completedStages: completed,
       };
     });
   };
 
-  const handleUpdateBible = (bible: WorldBible) => {
+  const handleRestoreScriptVersion = (projectId: string, index: number) => {
     setProject((prev) => {
+      if (prev.metadata.id !== projectId) return prev;
+      const version = restoreScriptVersion(prev, index);
+      if (!version) return prev;
+      return {
+        ...prev,
+        ...version,
+      };
+    });
+  };
+
+  const handleUpdateBible = (projectId: string, bible: WorldBible) => {
+    setProject((prev) => {
+      if (prev.metadata.id !== projectId) return prev;
       const completed: PipelineStage[] = prev.completedStages.includes('bible')
         ? prev.completedStages
         : [...prev.completedStages, 'bible'];
@@ -120,39 +211,52 @@ export default function App() {
     });
   };
 
-  const handleUpdateScenes = (scenes: Scene[]) => {
+  const handleUpdateScenes = (projectId: string, update: SceneUpdate) => {
     setProject((prev) => {
-      const completed: PipelineStage[] = prev.completedStages.includes('scenes')
-        ? prev.completedStages
-        : [...prev.completedStages, 'scenes'];
+      if (prev.metadata.id !== projectId) return prev;
+      const scenes = typeof update === 'function' ? update(prev.scenes) : update;
       return {
         ...prev,
         scenes,
-        completedStages: completed,
       };
     });
   };
 
-  const handleUpdateVideo = (videoUrl: string) => {
+  const handleUpdateVideo = async (projectId: string, video: Blob): Promise<string> => {
+    const assetId = await saveProjectVideo(projectId, video);
     setProject((prev) => {
+      if (prev.metadata.id !== projectId) return prev;
       const completed: PipelineStage[] = prev.completedStages.includes('video')
         ? prev.completedStages
         : [...prev.completedStages, 'video'];
       return {
         ...prev,
-        assembledVideoUrl: videoUrl,
+        assembledVideoUrl: undefined,
+        assembledVideoAssetId: assetId,
         completedStages: completed,
       };
     });
+    return assetId;
   };
 
   // Project switcher
-  const handleSelectProject = (id: string) => {
-    const loaded = loadProjectLocal(id);
-    if (loaded) {
-      setProject(loaded);
-      setActiveProjectId(id);
-      setCurrentStage('project');
+  const projectLoadSequence = useRef(0);
+  const handleSelectProject = async (id: string) => {
+    const sequence = ++projectLoadSequence.current;
+    try {
+      const loaded = await loadProjectLocal(id);
+      if (sequence !== projectLoadSequence.current) return;
+      if (loaded) {
+        setProject(loaded);
+        setActiveProjectId(id);
+        setCurrentStage(loaded.currentStage);
+        setProjectRecoveryFailed(false);
+        setSaveError('');
+        setSaveStatus('saved');
+      }
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Could not load this project.');
+      setSaveStatus('failed');
     }
   };
 
@@ -161,14 +265,18 @@ export default function App() {
     setIsProjectModalOpen(true);
   };
 
-  const handleSaveProjectMetadata = (partial: Partial<ProjectMetadata>) => {
+  const handleSaveProjectMetadata = async (partial: Partial<ProjectMetadata>) => {
     if (isCreatingNew) {
-      const newProj = createNewBlankProject(partial);
-      setProject(newProj);
-      setActiveProjectId(newProj.metadata.id);
-      setAllProjects(listAllProjects());
-      setCurrentStage('project');
-      setIsCreatingNew(false);
+      try {
+        const newProj = await createNewBlankProject(partial);
+        setProject(newProj);
+        setActiveProjectId(newProj.metadata.id);
+        setAllProjects(await listAllProjects());
+        setCurrentStage(newProj.currentStage);
+        setIsCreatingNew(false);
+      } catch (error) {
+        alert(error instanceof Error ? error.message : 'Could not create the project.');
+      }
     } else {
       setProject((prev) => ({
         ...prev,
@@ -180,18 +288,18 @@ export default function App() {
     }
   };
 
-  const handleDeleteCurrentProject = () => {
+  const handleDeleteCurrentProject = async () => {
     if (project.metadata.isDemo) return;
     if (confirm(`Are you sure you want to delete "${project.metadata.title}"?`)) {
-      deleteProjectLocal(project.metadata.id);
+      await deleteProjectLocal(project.metadata.id);
       setProject(DEMO_PROJECT_SIGNAL);
       setActiveProjectId(DEMO_PROJECT_SIGNAL.metadata.id);
-      setAllProjects(listAllProjects());
-      setCurrentStage('project');
+      setAllProjects(await listAllProjects());
+      setCurrentStage(DEMO_PROJECT_SIGNAL.currentStage);
     }
   };
 
-  const handleDuplicateCurrentProject = () => {
+  const handleDuplicateCurrentProject = async () => {
     const duplicate: Project = {
       ...project,
       metadata: {
@@ -203,19 +311,53 @@ export default function App() {
         isDemo: false,
       },
     };
-    saveProjectLocal(duplicate);
-    setProject(duplicate);
-    setActiveProjectId(duplicate.metadata.id);
-    setAllProjects(listAllProjects());
+    try {
+      await saveProjectLocal(duplicate);
+      setProject(duplicate);
+      setActiveProjectId(duplicate.metadata.id);
+      setAllProjects(await listAllProjects());
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Could not duplicate the project.');
+    }
   };
 
-  const handleImportProject = (imported: Project) => {
-    saveProjectLocal(imported);
-    setProject(imported);
-    setActiveProjectId(imported.metadata.id);
-    setAllProjects(listAllProjects());
-    setCurrentStage('project');
+  const handleImportProject = async (imported: Project): Promise<boolean> => {
+    const existing = await loadProjectLocal(imported.metadata.id);
+    if (existing && !confirm(`A project named "${existing.metadata.title}" already uses this backup ID. Replace it?`)) {
+      return false;
+    }
+    let importedVideoAssetId: string | undefined;
+    try {
+      if (imported.assembledVideoDataUrl) {
+        const videoBlob = await fetch(imported.assembledVideoDataUrl).then((response) => response.blob());
+        importedVideoAssetId = await saveProjectVideo(imported.metadata.id, videoBlob);
+      }
+      const { assembledVideoDataUrl: _videoDataUrl, ...importedWithoutVideoData } = imported;
+      const projectToSave: Project = {
+        ...importedWithoutVideoData,
+        metadata: { ...imported.metadata, isDemo: false },
+        assembledVideoAssetId: importedVideoAssetId,
+      };
+      await saveProjectLocal(projectToSave);
+      setProject(projectToSave);
+      setActiveProjectId(imported.metadata.id);
+      setAllProjects(await listAllProjects());
+      setCurrentStage(imported.currentStage);
+      return true;
+    } catch (error) {
+      if (importedVideoAssetId) await deleteProjectVideo(importedVideoAssetId);
+      alert(error instanceof Error ? error.message : 'Could not save the imported project.');
+      return false;
+    }
   };
+
+  if (!projectReady) {
+    return (
+      <div role="status" className="flex min-h-screen items-center justify-center bg-zinc-950 text-sm text-zinc-300">
+        Restoring your SceneCraft workspace…
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans selection:bg-amber-400 selection:text-zinc-950">
@@ -229,16 +371,27 @@ export default function App() {
           setIsCreatingNew(false);
           setIsProjectModalOpen(true);
         }}
-        isSaving={isSaving}
+        saveStatus={saveStatus}
+        saveError={saveError}
+        onSaveNow={handleSaveNow}
         hasAiKey={hasAiKey}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
       />
+
+      {saveStatus === 'failed' && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 border-b border-rose-900/70 bg-rose-950/40 px-4 py-2 text-xs text-rose-200 sm:px-6">
+          <span>{saveError || 'Project could not be saved.'}</span>
+          <button type="button" onClick={handleSaveNow} className="rounded border border-rose-700 px-2.5 py-1 font-medium hover:bg-rose-900/40">
+            Retry save
+          </button>
+        </div>
+      )}
 
       {/* Sequential Pipeline Navigation Bar */}
       <PipelineNav
         currentStage={currentStage}
         completedStages={project.completedStages}
-        onSelectStage={(stage) => setCurrentStage(stage)}
+        onSelectStage={navigateToStage}
       />
 
       {/* Main Workspace Stage Viewport */}
@@ -246,7 +399,7 @@ export default function App() {
         {currentStage === 'project' && (
           <ProjectOverview
             project={project}
-            onNavigateStage={(stage) => setCurrentStage(stage)}
+            onNavigateStage={navigateToStage}
             onEditMetadata={() => {
               setIsCreatingNew(false);
               setIsProjectModalOpen(true);
@@ -259,10 +412,11 @@ export default function App() {
         {currentStage === 'script' && (
           <ScriptStage
             project={project}
-            onUpdateScript={handleUpdateScript}
+            onUpdateScript={(update, label) => handleUpdateScript(project.metadata.id, update, label)}
+            onRestoreVersion={(index) => handleRestoreScriptVersion(project.metadata.id, index)}
             onProceedToBible={() => {
               markStageCompleted('script');
-              setCurrentStage('bible');
+              navigateToStage('bible');
             }}
           />
         )}
@@ -270,10 +424,10 @@ export default function App() {
         {currentStage === 'bible' && (
           <WorldBibleStage
             project={project}
-            onUpdateBible={handleUpdateBible}
+            onUpdateBible={(bible) => handleUpdateBible(project.metadata.id, bible)}
             onProceedToScenes={() => {
               markStageCompleted('bible');
-              setCurrentStage('scenes');
+              navigateToStage('scenes');
             }}
           />
         )}
@@ -281,10 +435,10 @@ export default function App() {
         {currentStage === 'scenes' && (
           <SceneStage
             project={project}
-            onUpdateScenes={handleUpdateScenes}
+            onUpdateScenes={(update) => handleUpdateScenes(project.metadata.id, update)}
             onProceedToStoryboard={() => {
               markStageCompleted('scenes');
-              setCurrentStage('storyboard');
+              navigateToStage('storyboard');
             }}
           />
         )}
@@ -292,34 +446,36 @@ export default function App() {
         {currentStage === 'storyboard' && (
           <StoryboardStage
             project={project}
-            onUpdateScenes={handleUpdateScenes}
+            onUpdateScenes={(update) => handleUpdateScenes(project.metadata.id, update)}
             onProceedToAudio={() => {
               markStageCompleted('storyboard');
-              setCurrentStage('audio');
+              navigateToStage('audio');
             }}
             hasGeminiKey={hasGeminiKey}
+            activeProvider={activeProvider}
           />
         )}
 
         {currentStage === 'audio' && (
           <AudioStage
             project={project}
-            onUpdateScenes={handleUpdateScenes}
+            onUpdateScenes={(update) => handleUpdateScenes(project.metadata.id, update)}
             onProceedToVideo={() => {
               markStageCompleted('audio');
-              setCurrentStage('video');
+              navigateToStage('video');
             }}
             hasGeminiKey={hasGeminiKey}
+            activeProvider={activeProvider}
           />
         )}
 
         {currentStage === 'video' && (
           <VideoStage
             project={project}
-            onUpdateProjectVideo={handleUpdateVideo}
+            onUpdateProjectVideo={(video) => handleUpdateVideo(project.metadata.id, video)}
             onProceedToExport={() => {
               markStageCompleted('video');
-              setCurrentStage('export');
+              navigateToStage('export');
             }}
           />
         )}
@@ -364,6 +520,7 @@ export default function App() {
           checkServerHealth().then((res) => {
             setHasGeminiKey(res.hasGeminiKey);
             setHasAiKey(Boolean(res.hasAiKey));
+            if (res.provider) setActiveProvider(res.provider);
           });
         }}
       />

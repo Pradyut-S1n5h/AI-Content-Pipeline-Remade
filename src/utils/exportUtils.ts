@@ -9,6 +9,7 @@
  */
 
 import { Project, Scene } from '../types';
+import { escapeHtml } from './projectBackup';
 
 export function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -18,7 +19,7 @@ export function downloadBlob(blob: Blob, filename: string) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 export function downloadText(content: string, filename: string, mimeType = 'text/plain') {
@@ -86,16 +87,20 @@ export function exportScenesAsCSV(scenes: Scene[]): string {
     'Visual Prompt',
   ];
 
+  const csvText = (value: string) => {
+    const safeValue = /^[\t\r\n ]*[=+\-@]/.test(value) ? `'${value}` : value;
+    return `"${safeValue.replace(/"/g, '""')}"`;
+  };
   const rows = scenes.map((s) => [
-    s.sceneNumber,
-    `"${(s.title || '').replace(/"/g, '""')}"`,
-    `"${(s.setting || '').replace(/"/g, '""')}"`,
-    s.timeOfDay,
-    s.durationSeconds,
-    `"${(s.cameraDirection || '').replace(/"/g, '""')}"`,
-    `"${(s.mood || '').replace(/"/g, '""')}"`,
-    `"${(s.characters || []).join(', ')}"`,
-    `"${(s.imagePrompt || '').replace(/"/g, '""')}"`,
+    String(s.sceneNumber),
+    csvText(s.title || ''),
+    csvText(s.setting || ''),
+    csvText(s.timeOfDay),
+    String(s.durationSeconds),
+    csvText(s.cameraDirection || ''),
+    csvText(s.mood || ''),
+    csvText((s.characters || []).join(', ')),
+    csvText(s.imagePrompt || ''),
   ]);
 
   return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
@@ -108,26 +113,30 @@ export function openPrintableStoryboard(project: Project) {
     return;
   }
 
+  const imageSource = (url: string | undefined) =>
+    url && (/^https:\/\//i.test(url) || /^data:image\/(?:png|jpeg|webp|gif);base64,/i.test(url))
+      ? escapeHtml(url)
+      : '';
   const scenesHtml = project.scenes
     .map(
       (s) => `
     <div class="scene-card">
       <div class="image-box">
         ${
-          s.imageUrl
-            ? `<img src="${s.imageUrl}" alt="Scene ${s.sceneNumber}" />`
+          imageSource(s.imageUrl)
+            ? `<img src="${imageSource(s.imageUrl)}" alt="Scene ${escapeHtml(String(s.sceneNumber))}" />`
             : `<div class="placeholder">Scene ${s.sceneNumber} [Pending Visual]</div>`
         }
       </div>
       <div class="meta-box">
         <div class="scene-header">
           <span class="scene-num">Scene ${s.sceneNumber}</span>
-          <span class="scene-duration">${s.durationSeconds}s · ${s.timeOfDay}</span>
+          <span class="scene-duration">${escapeHtml(String(s.durationSeconds))}s · ${escapeHtml(s.timeOfDay)}</span>
         </div>
-        <h3 class="scene-title">${s.title}</h3>
-        <p class="scene-camera"><strong>Camera:</strong> ${s.cameraDirection || 'Standard'}</p>
-        <p class="scene-desc">${s.description || s.actions || ''}</p>
-        ${s.dialogue ? `<blockquote class="scene-dialogue">${s.dialogue.replace(/\n/g, '<br/>')}</blockquote>` : ''}
+        <h3 class="scene-title">${escapeHtml(s.title)}</h3>
+        <p class="scene-camera"><strong>Camera:</strong> ${escapeHtml(s.cameraDirection || 'Standard')}</p>
+        <p class="scene-desc">${escapeHtml(s.description || s.actions || '')}</p>
+        ${s.dialogue ? `<blockquote class="scene-dialogue">${escapeHtml(s.dialogue).replace(/\n/g, '<br/>')}</blockquote>` : ''}
       </div>
     </div>
   `
@@ -139,7 +148,7 @@ export function openPrintableStoryboard(project: Project) {
 <html>
 <head>
   <meta charset="utf-8">
-  <title>${project.metadata.title} - Storyboard</title>
+  <title>${escapeHtml(project.metadata.title)} - Storyboard</title>
   <style>
     @media print {
       body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
@@ -216,8 +225,8 @@ export function openPrintableStoryboard(project: Project) {
 </head>
 <body>
   <div class="header">
-    <h1 class="title">${project.metadata.title}</h1>
-    <p class="subtitle">Storyboard Breakdown · ${project.scenes.length} Scenes · Total Runtime: ~${project.metadata.targetDurationMinutes} min</p>
+    <h1 class="title">${escapeHtml(project.metadata.title)}</h1>
+    <p class="subtitle">Storyboard Breakdown · ${project.scenes.length} Scenes · Total Runtime: ~${escapeHtml(String(project.metadata.targetDurationMinutes))} min</p>
     <button class="btn-print no-print" onclick="window.print()">Print / Save as PDF</button>
   </div>
   <div class="grid">

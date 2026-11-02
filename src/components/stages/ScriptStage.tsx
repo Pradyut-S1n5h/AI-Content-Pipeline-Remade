@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Project, ScriptSection } from '../../types';
+import { Project, ScriptSection, ScriptUpdate } from '../../types';
 import { generateScriptApi, regenerateScriptSectionApi } from '../../services/api';
 import {
   Sparkles,
@@ -10,17 +10,21 @@ import {
   BookOpen,
   AlertCircle,
   Wand2,
+  Undo2,
+  Redo2,
 } from 'lucide-react';
 
 interface ScriptStageProps {
   project: Project;
-  onUpdateScript: (script: ScriptSection) => void;
+  onUpdateScript: (update: ScriptUpdate, label?: string) => void;
+  onRestoreVersion: (index: number) => void;
   onProceedToBible: () => void;
 }
 
 export const ScriptStage: React.FC<ScriptStageProps> = ({
   project,
   onUpdateScript,
+  onRestoreVersion,
   onProceedToBible,
 }) => {
   const [isGenerating, setIsGenerating] = useState(false);
@@ -39,6 +43,8 @@ export const ScriptStage: React.FC<ScriptStageProps> = ({
   };
 
   const handleGenerateFullScript = async () => {
+    if (hasScript && !confirm('Regenerating the full screenplay will replace its current contents. Continue?')) return;
+    const scriptAtStart = script;
     setIsGenerating(true);
     setErrorMessage(null);
 
@@ -56,7 +62,15 @@ export const ScriptStage: React.FC<ScriptStageProps> = ({
     setIsGenerating(false);
 
     if (res.success && res.data) {
-      onUpdateScript(res.data);
+      onUpdateScript((current) => ({
+        title: current.title !== scriptAtStart.title ? current.title : res.data!.title,
+        logline: current.logline !== scriptAtStart.logline ? current.logline : res.data!.logline,
+        synopsis: current.synopsis !== scriptAtStart.synopsis ? current.synopsis : res.data!.synopsis,
+        fullScript: current.fullScript !== scriptAtStart.fullScript ? current.fullScript : res.data!.fullScript,
+        targetAudienceNotes: current.targetAudienceNotes !== scriptAtStart.targetAudienceNotes
+          ? current.targetAudienceNotes
+          : res.data!.targetAudienceNotes,
+      }), 'Generated full screenplay');
     } else {
       setErrorMessage(
         res.error || 'Failed to generate script. Make sure your server has a valid GEMINI_API_KEY or explore the pre-loaded demo project.'
@@ -79,11 +93,10 @@ export const ScriptStage: React.FC<ScriptStageProps> = ({
     setIsRewriting(false);
 
     if (res.success && res.data) {
-      const updated = {
-        ...script,
-        [rewriteSection]: res.data.content,
-      };
-      onUpdateScript(updated);
+      onUpdateScript((current) => ({
+        ...current,
+        [rewriteSection]: res.data!.content,
+      }), `Rewrote ${rewriteSection}`);
       setRewriteSection(null);
       setRewriteInstructions('');
     } else {
@@ -92,13 +105,19 @@ export const ScriptStage: React.FC<ScriptStageProps> = ({
   };
 
   const handleFieldChange = (field: keyof ScriptSection, value: string) => {
-    onUpdateScript({
-      ...script,
-      [field]: value,
-    });
+    onUpdateScript((current) => ({ ...current, [field]: value }));
   };
 
   const hasScript = Boolean(script.fullScript && script.fullScript.trim().length > 0);
+  const history = project.scriptHistory?.length
+    ? project.scriptHistory
+    : [{ script, savedAt: project.metadata.updatedAt, label: 'Current draft' }];
+  const historyIndex = Math.max(0, Math.min(
+    project.scriptHistoryIndex ?? history.length - 1,
+    history.length - 1
+  ));
+  const wordCount = script.fullScript.trim() ? script.fullScript.trim().split(/\s+/).length : 0;
+  const characterCount = script.fullScript.length;
 
   return (
     <div className="max-w-5xl mx-auto py-8 px-6 space-y-6">
@@ -114,6 +133,38 @@ export const ScriptStage: React.FC<ScriptStageProps> = ({
         </div>
 
         <div className="flex items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => onRestoreVersion(historyIndex - 1)}
+            disabled={historyIndex <= 0}
+            aria-label="Undo screenplay change"
+            title="Undo"
+            className="rounded border border-zinc-700 p-2 text-zinc-300 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <Undo2 className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => onRestoreVersion(historyIndex + 1)}
+            disabled={historyIndex >= history.length - 1}
+            aria-label="Redo screenplay change"
+            title="Redo"
+            className="rounded border border-zinc-700 p-2 text-zinc-300 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <Redo2 className="h-3.5 w-3.5" />
+          </button>
+          <select
+            aria-label="Screenplay version history"
+            value={historyIndex}
+            onChange={(event) => onRestoreVersion(Number(event.target.value))}
+            className="max-w-36 rounded border border-zinc-700 bg-zinc-950 px-2 py-2 text-[10px] text-zinc-300"
+          >
+            {history.map((version, index) => (
+              <option key={`${version.savedAt}-${index}`} value={index}>
+                {new Date(version.savedAt).toLocaleString()} — {version.label}
+              </option>
+            ))}
+          </select>
           <button
             onClick={handleGenerateFullScript}
             disabled={isGenerating}
@@ -244,6 +295,9 @@ export const ScriptStage: React.FC<ScriptStageProps> = ({
               </p>
             </div>
             <div className="flex items-center gap-3">
+              <span className="text-[10px] text-zinc-500" aria-live="polite">
+                {wordCount} words · {characterCount} characters
+              </span>
               <button
                 onClick={() => setRewriteSection('fullScript')}
                 className="text-[11px] text-zinc-400 hover:text-amber-400 flex items-center gap-1 transition-colors"

@@ -13,6 +13,7 @@ import {
   Trash2,
   Copy,
   Info,
+  LucideIcon,
 } from 'lucide-react';
 
 interface ProjectOverviewProps {
@@ -36,7 +37,7 @@ export const ProjectOverview: React.FC<ProjectOverviewProps> = ({
     stage: PipelineStage;
     title: string;
     description: string;
-    icon: any;
+    icon: LucideIcon;
     count?: string;
   }[] = [
     {
@@ -84,7 +85,7 @@ export const ProjectOverview: React.FC<ProjectOverviewProps> = ({
     {
       stage: 'export',
       title: '08. Export Suite',
-      description: 'Fountain screenplay, CSV scenes, printable storyboard, MP4',
+      description: 'Fountain screenplay, CSV scenes, printable storyboard, and WebM video',
       icon: Download,
       count: 'Available',
     },

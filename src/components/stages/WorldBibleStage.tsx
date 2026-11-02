@@ -14,6 +14,8 @@ import {
   ArrowRight,
   AlertCircle,
   Palette,
+  ImagePlus,
+  X,
 } from 'lucide-react';
 
 interface WorldBibleStageProps {
@@ -90,6 +92,37 @@ export const WorldBibleStage: React.FC<WorldBibleStageProps> = ({
   const handleDeleteCharacter = (id: string) => {
     const chars = (bible.characters || []).filter((c) => c.id !== id);
     onUpdateBible({ ...bible, characters: chars });
+  };
+
+  const handleReferenceImagesSelected = async (files: FileList | null) => {
+    if (!files || !editingCharacter) return;
+    const targetId = editingCharacter.id;
+    const selected = Array.from(files);
+    if (selected.length + (editingCharacter.referenceImages?.length || 0) > 4) {
+      setErrorMessage('Each character can have at most four reference images.');
+      return;
+    }
+    if (selected.some((file) => !['image/png', 'image/jpeg', 'image/webp'].includes(file.type) ||
+        file.size > 2 * 1024 * 1024)) {
+      setErrorMessage('Reference images must be PNG, JPEG, or WebP files smaller than 2 MB each.');
+      return;
+    }
+    try {
+      const dataUrls = await Promise.all(selected.map((file) => new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => typeof reader.result === 'string'
+          ? resolve(reader.result)
+          : reject(new Error('Could not read the selected reference image.'));
+        reader.onerror = () => reject(new Error(`Could not read reference image "${file.name}".`));
+        reader.readAsDataURL(file);
+      })));
+      setEditingCharacter((current) => current?.id === targetId
+        ? { ...current, referenceImages: [...(current.referenceImages || []), ...dataUrls] }
+        : current);
+      setErrorMessage(null);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Could not load reference images.');
+    }
   };
 
   // Location mutations
@@ -312,6 +345,9 @@ export const WorldBibleStage: React.FC<WorldBibleStageProps> = ({
                   </div>
 
                   <p className="text-xs text-zinc-300 leading-relaxed">{char.description}</p>
+                  {char.referenceImages?.length ? (
+                    <p className="text-[11px] text-zinc-500">{char.referenceImages.length} visual reference image{char.referenceImages.length === 1 ? '' : 's'} attached</p>
+                  ) : null}
 
                   <div className="pt-2 border-t border-zinc-800/80 space-y-1.5 text-xs">
                     <div>
@@ -495,7 +531,7 @@ export const WorldBibleStage: React.FC<WorldBibleStageProps> = ({
       {/* Character Edit Modal */}
       {editingCharacter && (
         <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-zinc-900 border border-zinc-800 rounded-lg w-full max-w-lg p-6 space-y-4">
+          <div className="max-h-[85vh] overflow-y-auto bg-zinc-900 border border-zinc-800 rounded-lg w-full max-w-lg p-6 space-y-4">
             <h3 className="text-sm font-semibold text-zinc-100">
               {isNewChar ? 'New Character Profile' : 'Edit Character Profile'}
             </h3>
@@ -585,6 +621,48 @@ export const WorldBibleStage: React.FC<WorldBibleStageProps> = ({
                   }
                   className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 text-zinc-100 focus:outline-none focus:border-amber-400"
                 />
+              </div>
+              <div>
+                <div className="mb-1 flex items-center justify-between">
+                  <label className="text-zinc-300 font-medium">Visual Reference Images</label>
+                  <span className="text-zinc-500">{editingCharacter.referenceImages?.length || 0}/4</span>
+                </div>
+                <p className="mb-2 text-[11px] text-zinc-500">
+                  Gemini and OpenAI image models receive these references for matching scenes. PNG, JPEG, or WebP; up to 2 MB each.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {(editingCharacter.referenceImages || []).map((image, index) => (
+                    <div key={`${editingCharacter.id}-reference-${index}`} className="relative h-16 w-16 overflow-hidden rounded border border-zinc-700">
+                      <img src={image} alt={`Character reference ${index + 1}`} className="h-full w-full object-cover" />
+                      <button
+                        type="button"
+                        aria-label={`Remove reference image ${index + 1}`}
+                        onClick={() => setEditingCharacter({
+                          ...editingCharacter,
+                          referenceImages: editingCharacter.referenceImages?.filter((_, itemIndex) => itemIndex !== index),
+                        })}
+                        className="absolute right-0 top-0 rounded-bl bg-black/80 p-1 text-white"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+                  {(editingCharacter.referenceImages?.length || 0) < 4 && (
+                    <label className="flex h-16 w-16 cursor-pointer items-center justify-center rounded border border-dashed border-zinc-700 text-zinc-400 hover:border-amber-400 hover:text-amber-300">
+                      <ImagePlus className="h-5 w-5" />
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        multiple
+                        className="sr-only"
+                        onChange={(event) => {
+                          void handleReferenceImagesSelected(event.target.files);
+                          event.target.value = '';
+                        }}
+                      />
+                    </label>
+                  )}
+                </div>
               </div>
             </div>
 

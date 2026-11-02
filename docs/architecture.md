@@ -26,7 +26,7 @@ SceneCraft is built as a full-stack, modular TypeScript application designed to 
 |   |  - Static & Vite Dev Middleware                               |   |
 |   |  - Input Validation & Schema Enforcement                      |   |
 |   |  - Session-scoped Gemini/OpenAI/Anthropic/HF text adapters    |   |
-|   |  - Gemini-only image/audio adapters                           |   |
+|   |  - Gemini/OpenAI image/audio adapters                         |   |
 |   |  - Health, settings, and key-verification endpoints            |   |
 |   +-------------------------------+-------------------------------+   |
 +-----------------------------------|-----------------------------------+
@@ -44,7 +44,7 @@ SceneCraft is built as a full-stack, modular TypeScript application designed to 
 ## Client-Server Separation & Security
 
 ### Why Server-Side AI?
-1. **API Key Security**: Environment keys are read server-side. Web-entered keys are held in server memory under a random `HttpOnly`, `SameSite=Strict` session cookie; API responses expose only whether a key exists and a fixed mask. They are never stored in browser storage or project data.
+1. **API Key Security**: Environment keys are read server-side. Web-entered keys are associated with an opaque `HttpOnly`, `SameSite=Strict` cookie; when configured, an AES-256-GCM vault encrypts keys at rest using an independently managed 32-byte `SCENECRAFT_KEY_ENCRYPTION_KEY`. API responses expose key status only. Production cookies use `Secure`.
 2. **Schema Enforcement**: Structured JSON responses are validated server-side before returning to the React client.
 3. **Bounded Requests**: Session limits cap generation frequency, prompts, and output tokens. Retries are limited to transient failures; invalid credentials and quota/rate-limit errors are not retried.
 
@@ -53,12 +53,12 @@ SceneCraft is built as a full-stack, modular TypeScript application designed to 
 ## State Management & Local Persistence
 
 SceneCraft follows a resilient local-first architecture:
-- **Primary Storage**: `localStorage` acts as an immediate cache for user projects (`scenecraft_proj_<id>`).
-- **Autosave Engine**: `App.tsx` contains a debounced autosave effect (600ms) that commits all edits without interrupting user typing.
-- **Portability**: The Export Suite allows users to export complete project packages as `.json` files and import them on any device.
+- **Primary Storage**: IndexedDB stores versioned project records and large media assets. Existing localStorage project records are migrated to IndexedDB; localStorage remains for the active-project pointer and a compatibility fallback.
+- **Autosave Engine**: `App.tsx` debounces autosave by 600ms; the header reports unsaved, saving, saved, or failed states and offers manual save.
+- **Portability**: Project backup JSON is versioned, validated, and retains legacy import support. It includes storyboard/audio data and the persisted rendered video; import stores the video as an IndexedDB Blob.
 - **Offline / Demo Resilience**: If no Gemini API key is configured on the host server, the application enters a clean, fully operational **Demo Mode** loaded with the complete *The Last Signal* short film project.
-- **AI Settings**: Provider/model preferences and web-entered keys remain server-side in memory and are lost when the process restarts. Projects continue to autosave locally; they do not contain keys or AI settings.
-- **Media Provider**: Image and TTS generation are Gemini-only. An OpenAI text selection returns an explicit error for those operations instead of switching providers.
+- **AI Settings**: Provider/model preferences remain server-side and projects never contain keys or AI settings. Web-entered keys survive restarts only when the independent encryption secret and persistent vault storage are configured.
+- **Media Provider**: Gemini and OpenAI support image and speech. Anthropic and Hugging Face are explicitly text-only; unsupported operations are disabled and return a clear API error.
 
 ---
 
@@ -67,11 +67,12 @@ SceneCraft follows a resilient local-first architecture:
 Rather than relying on third-party cloud video rendering services that require paid subscriptions or mock buttons, SceneCraft implements a **genuine browser-side video assembler**:
 
 1. **Asset Preparation**: Preloads all scene image assets into `HTMLImageElement` buffers.
-2. **Canvas Pipeline**: Allocates an off-screen `HTMLCanvasElement` (1280x720 @ 30 FPS).
+2. **Canvas Pipeline**: Allocates an off-screen `HTMLCanvasElement` at 30 FPS using the project's selected aspect ratio.
 3. **Cinematic Processing**:
-   - Calculates duration-adjusted frame counts per scene.
+   - Calculates duration-adjusted frame counts per scene and paces frames at the recording rate.
    - Applies continuous Ken Burns scale (1.0 to 1.08) and subtle panning.
    - Overlays cinematic vignetting and lower-third typography (Scene Number, Title, Camera Framing).
-4. **Encoding**: Captures stream via `canvas.captureStream(30)` into `MediaRecorder` (`video/webm;codecs=vp9` or native container).
-5. **Progressive Feedback**: Emits real pipeline status (`preparing_assets` -> `rendering_frames` -> `finalizing` -> `completed`).
-6. **Output**: Produces a valid, playable `Blob` ready for immediate in-browser preview and file download.
+4. **Audio**: Decodes generated per-scene WAV assets and schedules them on a Web Audio stream alongside the canvas.
+5. **Encoding**: Captures stream via `canvas.captureStream(30)` and selects MP4 only when `MediaRecorder.isTypeSupported` confirms it; otherwise chooses a supported WebM codec.
+6. **Progressive Feedback**: Emits progress, supports abort, rejects unavailable or failed assets rather than drawing a fake placeholder, and stops media tracks/audio contexts when complete.
+7. **Output**: Checks for a non-empty supported media Blob, persists it in IndexedDB, previews it through a temporary object URL, and includes it in project backups. The object URL is recreated on restore.

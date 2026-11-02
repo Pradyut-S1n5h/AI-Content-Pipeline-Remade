@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { ProjectMetadata, ContentType } from '../types';
 import { X, Sparkles } from 'lucide-react';
 
@@ -35,6 +35,7 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
   const [targetDurationMinutes, setTargetDurationMinutes] = useState(
     metadata.targetDurationMinutes || 3
   );
+  const [durationError, setDurationError] = useState('');
   const [tone, setTone] = useState(metadata.tone || 'Cinematic, engaging');
   const [targetAudience, setTargetAudience] = useState(
     metadata.targetAudience || 'General Audience'
@@ -47,10 +48,41 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
     metadata.aspectRatio || '16:9'
   );
 
+  useEffect(() => {
+    if (!isOpen) return;
+    setDurationError('');
+    setTitle(metadata.title || '');
+    setIdea(metadata.idea || '');
+    setContentType(metadata.contentType || 'short_film');
+    setTargetDurationMinutes(metadata.targetDurationMinutes || 3);
+    setTone(metadata.tone || 'Cinematic, engaging');
+    setTargetAudience(metadata.targetAudience || 'General Audience');
+    setLanguage(metadata.language || 'English');
+    setVisualStyle(metadata.visualStyle || 'Cinematic 35mm film, atmospheric lighting');
+    setAspectRatio(metadata.aspectRatio || '16:9');
+  }, [
+    isOpen,
+    metadata.id,
+    metadata.title,
+    metadata.idea,
+    metadata.contentType,
+    metadata.targetDurationMinutes,
+    metadata.tone,
+    metadata.targetAudience,
+    metadata.language,
+    metadata.visualStyle,
+    metadata.aspectRatio,
+  ]);
+
   if (!isOpen) return null;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!Number.isFinite(targetDurationMinutes) || targetDurationMinutes < 1 || targetDurationMinutes > 60) {
+      setDurationError('Duration must be between 1 and 60 minutes.');
+      return;
+    }
+    setDurationError('');
     onSave({
       title: title.trim() || 'Untitled Project',
       idea: idea.trim(),
@@ -97,7 +129,6 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
               onChange={(e) => setTitle(e.target.value)}
               placeholder="e.g. The Last Signal"
               className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-amber-400 text-xs"
-              required
             />
           </div>
 
@@ -112,7 +143,6 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
               rows={4}
               placeholder="Describe what your content is about, the protagonist, the conflict, or the message you want to communicate..."
               className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-amber-400 text-xs leading-relaxed"
-              required
             />
           </div>
 
@@ -147,6 +177,7 @@ export const ProjectModal: React.FC<ProjectModalProps> = ({
                 onChange={(e) => setTargetDurationMinutes(Number(e.target.value))}
                 className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-zinc-100 focus:outline-none focus:border-amber-400 text-xs"
               />
+              {durationError && <p role="alert" className="mt-1 text-[11px] text-red-300">{durationError}</p>}
             </div>
 
             {/* Tone / Style */}

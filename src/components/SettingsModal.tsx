@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Eye, KeyRound, LoaderCircle, RefreshCw, Save, ShieldCheck, Trash2, X } from 'lucide-react';
+import { Eye, EyeOff, KeyRound, LoaderCircle, RefreshCw, Save, ShieldCheck, Trash2, X } from 'lucide-react';
 import {
   AiSettings,
   getAiSettings,
@@ -8,7 +8,13 @@ import {
   saveAiSettings,
   testAiSettings,
 } from '../services/api';
-import { AiProvider, ModelOption, PROVIDER_MODELS, ThinkingLevel } from '../services/aiProviders';
+import {
+  AiProvider,
+  ModelOption,
+  PROVIDER_CAPABILITIES,
+  PROVIDER_MODELS,
+  ThinkingLevel,
+} from '../services/aiProviders';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -26,13 +32,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
   const [modelOptions, setModelOptions] = useState<ModelOption[]>(PROVIDER_MODELS.gemini);
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>('medium');
   const [apiKey, setApiKey] = useState('');
+  const [isKeyVisible, setIsKeyVisible] = useState(false);
   const [busyAction, setBusyAction] = useState<'loading' | 'testing' | 'saving' | 'removing' | null>(null);
   const busy = busyAction !== null;
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setApiKey('');
+      setIsKeyVisible(false);
+      return;
+    }
     setBusyAction('loading');
     setError('');
     getAiSettings().then((result) => {
@@ -57,19 +68,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
 
   const selectedModel = modelOptions.find((option) => option.id === model) ||
     PROVIDER_MODELS[provider].find((option) => option.id === model) || { id: model, label: model, supportsThinking: false };
-  const savedForProvider = settings?.provider === provider && settings.hasSavedKey;
-  const envKeyForProvider = settings?.provider === provider && settings.keySource === 'environment';
+  const keySource = settings?.keySources?.[provider] ??
+    (settings?.provider === provider ? settings.keySource : 'none');
+  const savedForProvider = keySource === 'session' || keySource === 'persistent';
+  const envKeyForProvider = keySource === 'environment';
   const canThink = selectedModel.supportsThinking;
 
   const refreshModels = async (nextProvider: AiProvider, key = apiKey.trim() || undefined) => {
     const result = await getProviderModels(nextProvider, key);
     if (result.success && result.data?.length) {
       setModelOptions(result.data);
+      setModel((selected) => result.data!.some((option) => option.id === selected)
+        ? selected
+        : result.data![0].id);
       return result.data;
     }
-    setModelOptions(PROVIDER_MODELS[nextProvider]);
+    const fallbackModels = PROVIDER_MODELS[nextProvider];
+    setModelOptions(fallbackModels);
+    setModel((selected) => fallbackModels.some((option) => option.id === selected)
+      ? selected
+      : fallbackModels[0].id);
     if (!result.success) setError(result.error || 'Could not load provider models.');
-    return PROVIDER_MODELS[nextProvider];
+    return fallbackModels;
   };
 
   const handleProviderChange = async (nextProvider: AiProvider) => {
@@ -79,7 +99,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
     setApiKey('');
     setNotice('');
     setError('');
-    await refreshModels(nextProvider);
+    await refreshModels(nextProvider, '');
   };
 
   const handleSave = async () => {
@@ -99,7 +119,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
     }
     setSettings(result.data);
     setApiKey('');
-    setNotice('Settings saved for this browser session.');
+    setNotice(result.data.keyPersistenceAvailable
+      ? 'Settings saved. Provider keys are encrypted on the server and can be restored for up to 30 days.'
+      : 'Settings saved for this browser session. Configure encrypted key persistence to keep keys after a server restart.');
     await refreshModels(provider);
     onSaved();
   };
@@ -130,9 +152,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
     }
     setSettings(result.data);
     setApiKey('');
-    setNotice(result.data.keySource === 'environment'
+    setNotice(result.data.keySources?.[provider] === 'environment'
       ? 'Session key removed. The environment-managed key remains active.'
-      : 'Session key removed from server memory.');
+      : 'Saved key removed from the server.');
     onSaved();
   };
 
@@ -174,17 +196,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
             <div>
               <label className="mb-1.5 block text-xs font-medium text-zinc-300">API key</label>
               <div className="relative">
-                <input type="password" autoComplete="new-password" spellCheck={false} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={settings?.provider === provider && settings.maskedKey ? settings.maskedKey : `Enter ${{
+                <input type={isKeyVisible ? 'text' : 'password'} autoComplete="new-password" spellCheck={false} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={keySource !== 'none' ? 'Configured (enter a new key to replace)' : `Enter ${{
                   gemini: 'Gemini', openai: 'OpenAI', anthropic: 'Anthropic', huggingface: 'Hugging Face',
                 }[provider]} API key`} className={`${inputStyle} pr-10`} />
-                <ShieldCheck className="absolute right-3 top-2.5 h-4 w-4 text-zinc-500" aria-hidden="true" />
+                <button type="button" onClick={() => setIsKeyVisible((visible) => !visible)} aria-label={isKeyVisible ? 'Hide API key' : 'Show API key'} className="absolute right-2 top-2 rounded p-1 text-zinc-500 hover:text-zinc-200">
+                  {isKeyVisible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
               </div>
               <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
                 {envKeyForProvider
                   ? 'An environment-managed key is active. A session key can temporarily replace it.'
-                  : savedForProvider
-                    ? 'A key is stored in server memory for this browser session; its value is never returned.'
-                    : 'The key is held in server memory only and is cleared when the server restarts.'}
+                  : keySource === 'persistent'
+                    ? 'A key is encrypted on the server for this browser session; its value is never returned.'
+                    : savedForProvider
+                      ? 'A key is stored in server memory for this browser session; its value is never returned.'
+                      : envKeyForProvider
+                        ? 'An environment-managed key is active for this provider.'
+                        : settings?.keyPersistenceAvailable
+                          ? 'No key is configured. Web-entered keys will be encrypted on the server.'
+                          : 'No key is configured. Without an encryption secret, web-entered keys remain in server memory only.'}
               </p>
             </div>
 
@@ -200,10 +230,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
               <p className="mt-1.5 text-[11px] text-zinc-500">{canThink ? 'Applied using this model’s supported reasoning parameter.' : 'This model does not expose a thinking-level parameter; choose a reasoning-capable model to enable it.'}</p>
             </fieldset>
 
-            {provider !== 'gemini' && <p className="text-[11px] leading-relaxed text-amber-200/80">Image and speech generation still require a Gemini key and Gemini selected as the active provider.</p>}
+            <p className="text-[11px] leading-relaxed text-zinc-400">
+              {PROVIDER_CAPABILITIES[provider].image && PROVIDER_CAPABILITIES[provider].speech
+                ? `${provider === 'gemini' ? 'Gemini' : 'OpenAI'} supports text, image, and speech generation with this provider's saved key.`
+                : `${provider} supports text generation only. Select Gemini or OpenAI for image and speech; SceneCraft will not switch providers automatically.`}
+            </p>
 
             <div className="flex items-center gap-2 border-t border-zinc-800 pt-4 text-[11px] text-zinc-500">
-              <Eye className="h-3.5 w-3.5 shrink-0" /> Keys are not saved in project data, browser storage, or URLs.
+              <Eye className="h-3.5 w-3.5 shrink-0" /> Keys are never saved in project data, browser storage, or URLs. {settings?.keyPersistenceAvailable ? 'Server-side backups use authenticated encryption.' : 'Configure SCENECRAFT_KEY_ENCRYPTION_KEY to keep web keys after a restart.'}
             </div>
           </>}
           {error && <p role="alert" className="rounded border border-red-900 bg-red-950/50 px-3 py-2 text-xs text-red-300">{error}</p>}
@@ -211,7 +245,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, o
         </div>
 
         <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 bg-zinc-950/50 px-5 py-3 sm:px-6">
-          <button type="button" onClick={handleRemove} disabled={busy || (!savedForProvider && !envKeyForProvider)} title="Remove the session key for this provider" className={`${buttonStyle} text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100`}><Trash2 className="h-3.5 w-3.5" />Remove key</button>
+          <button type="button" onClick={handleRemove} disabled={busy || (!savedForProvider && !envKeyForProvider)} title="Remove the saved key for this provider" className={`${buttonStyle} text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100`}><Trash2 className="h-3.5 w-3.5" />Remove key</button>
           <div className="ml-auto flex gap-2">
             <button type="button" onClick={handleTest} disabled={busy || (!apiKey.trim() && !savedForProvider && !envKeyForProvider)} className={`${buttonStyle} border border-zinc-700 text-zinc-200 hover:bg-zinc-800`}>{busyAction === 'testing' ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}{busyAction === 'testing' ? 'Testing…' : 'Test key'}</button>
             <button type="button" onClick={handleSave} disabled={busy || !settings} className={`${buttonStyle} bg-amber-400 text-zinc-950 hover:bg-amber-300`}>{busyAction === 'saving' ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}{busyAction === 'saving' ? 'Saving…' : 'Save settings'}</button>

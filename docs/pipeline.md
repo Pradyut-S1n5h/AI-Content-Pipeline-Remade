@@ -51,7 +51,7 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
 ---
 
 ## 05. Visual Storyboard Studio (`storyboard`)
-- **AI Model**: Gemini `gemini-2.5-flash-image` (Gemini provider required).
+- **AI Model**: Gemini `gemini-2.5-flash-image` or OpenAI `gpt-image-1`, based on the configured provider. Character reference images are passed when supported.
 - **States**:
   - `idle`: Pending visual generation.
   - `generating`: Active request with spinner and loading indicator.
@@ -62,9 +62,9 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
 ---
 
 ## 06. Voice Audio Studio (`audio`)
-- **AI Model**: Gemini `gemini-2.5-flash-preview-tts` (Gemini provider required).
-- **Voice Presets**: Kore, Puck, Charon, Fenrir, Zephyr.
-- **Audio Output**: Complete 24kHz 16-bit WAV file with RIFF header encoded as base64 data URI.
+- **AI Model**: Gemini `gemini-2.5-flash-preview-tts` or OpenAI `gpt-4o-mini-tts`, depending on the selected provider.
+- **Voice Presets**: Gemini Kore/Puck/Charon/Fenrir/Zephyr; OpenAI's supported preset voices.
+- **Audio Output**: Gemini PCM is wrapped in a 24kHz 16-bit WAV header; OpenAI returns WAV. Audio is retained as a base64 data URI.
 - **Philosophy**: Audio is strictly non-blocking and optional. Projects can proceed to video assembly and export with or without synthesized audio.
 
 ---
@@ -75,7 +75,12 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
   - Interactive animatic player with real-time audio sync.
   - Ken Burns cinematic zoom and pan rendering per scene.
   - Progress tracking through: *Preparing assets* -> *Rendering frames* -> *Finalizing* -> *Complete*.
-  - Direct `.webm` video download.
+  - Cancelable, real-time frame rendering at 30fps with image/audio resources released at completion.
+  - Per-scene generated WAV is mixed into the rendered video; audio clips are clipped to their scene duration.
+  - Aspect ratio follows project setup (16:9, 9:16, 1:1, or 4:3).
+  - Browser-supported MP4 is selected when available; otherwise a supported WebM codec is used.
+  - Rendered video is persisted in IndexedDB, can be downloaded after refresh, and is included in complete backups.
+- **Limitations**: Browser support for Canvas capture and at least one MediaRecorder container/codec is required. Rendering is real-time at 30fps.
 
 ---
 
@@ -83,5 +88,5 @@ SceneCraft structures the creative content creation journey into **8 distinct, n
 - **Screenplay**: Fountain (`.fountain`), Markdown (`.md`), Plain Text (`.txt`), Script JSON (`.json`).
 - **Scene Breakdown**: CSV spreadsheet (`.csv`), Scene JSON (`.json`).
 - **Storyboard**: Printable HTML document with dedicated print stylesheet and browser PDF export.
-- **Project Backup**: Full project JSON export and import.
+- **Project Backup**: Versioned, validated project JSON export/import; legacy unversioned projects are migrated. Generated images, audio, screenplay history, character references, and the saved video are included.
 - **Video Deliverable**: Download assembled video animatic.

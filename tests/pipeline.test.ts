@@ -198,6 +198,8 @@ describe('SceneCraft Pipeline Tests', () => {
     const csv = exportScenesAsCSV(proj.scenes);
     assert.ok(csv.includes('Scene Number,Title,Setting'));
     assert.ok(csv.includes('The Lonely Watch'));
+    const maliciousTitle = exportScenesAsCSV([{ ...proj.scenes[0], title: '=HYPERLINK("https://example.test")' }]);
+    assert.ok(maliciousTitle.includes(`"'=HYPERLINK(""https://example.test"")"`));
   });
 
   it('8. Pipeline progression stages integrity', () => {

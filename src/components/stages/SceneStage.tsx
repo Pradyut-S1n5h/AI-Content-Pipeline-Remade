@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Project, Scene } from '../../types';
+import { Project, Scene, SceneUpdate } from '../../types';
 import { breakdownScenesApi, generateVisualPromptApi } from '../../services/api';
 import {
   Film,
@@ -20,7 +20,7 @@ import {
 
 interface SceneStageProps {
   project: Project;
-  onUpdateScenes: (scenes: Scene[]) => void;
+  onUpdateScenes: (update: SceneUpdate) => void;
   onProceedToStoryboard: () => void;
 }
 

@@ -19,19 +19,57 @@ import {
   Scene,
   ApiResponse,
 } from '../types';
-import { AiProvider, ModelOption, PROVIDER_MODELS, ThinkingLevel } from './aiProviders';
+import {
+  AiProvider,
+  ModelOption,
+  PROVIDER_CAPABILITIES,
+  PROVIDER_MODELS,
+  ThinkingLevel,
+} from './aiProviders';
 
 export interface AiSettings {
   provider: AiProvider;
   model: string;
   thinkingLevel: ThinkingLevel;
   hasSavedKey: boolean;
-  keySource: 'session' | 'environment' | 'none';
+  keySource: 'session' | 'persistent' | 'environment' | 'none';
+  keySources: Record<AiProvider, 'session' | 'persistent' | 'environment' | 'none'>;
   maskedKey: string | null;
+  keyPersistenceAvailable: boolean;
+  capabilities: typeof PROVIDER_CAPABILITIES[AiProvider];
   models: typeof PROVIDER_MODELS;
 }
 
-async function postJson<T>(endpoint: string, body: any): Promise<ApiResponse<T>> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+async function decodeApiResponse<T>(response: Response): Promise<ApiResponse<T>> {
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    return { success: false, error: 'The server returned an invalid response. Try again.' };
+  }
+  if (!isRecord(payload) || typeof payload.success !== 'boolean') {
+    return { success: false, error: 'The server returned an unexpected response. Try again.' };
+  }
+  if (!response.ok || !payload.success) {
+    return {
+      success: false,
+      error: typeof payload.error === 'string'
+        ? payload.error
+        : typeof payload.message === 'string' ? payload.message : `Server error (${response.status})`,
+    };
+  }
+  return {
+    success: true,
+    ...(payload.data !== undefined ? { data: payload.data as T } : {}),
+    ...(typeof payload.message === 'string' ? { message: payload.message } : {}),
+  };
+}
+
+async function postJson<T>(endpoint: string, body: unknown): Promise<ApiResponse<T>> {
   try {
     const res = await fetch(endpoint, {
       method: 'POST',
@@ -40,19 +78,11 @@ async function postJson<T>(endpoint: string, body: any): Promise<ApiResponse<T>>
       },
       body: JSON.stringify(body),
     });
-
-    const data = await res.json();
-    if (!res.ok) {
-      return {
-        success: false,
-        error: data.error || data.message || `Server error (${res.status})`,
-      };
-    }
-    return data;
-  } catch (err: any) {
+    return await decodeApiResponse<T>(res);
+  } catch (err) {
     return {
       success: false,
-      error: err.message || 'Network request failed. Is the server running?',
+      error: err instanceof Error ? err.message : 'Network request failed. Is the server running?',
     };
   }
 }
@@ -61,11 +91,24 @@ export async function checkServerHealth(): Promise<{
   status: string;
   hasGeminiKey: boolean;
   hasAiKey?: boolean;
+  provider?: AiProvider;
 }> {
   try {
     const res = await fetch('/api/health');
     if (res.ok) {
-      return await res.json();
+      const payload: unknown = await res.json();
+      if (isRecord(payload) && typeof payload.status === 'string' &&
+          typeof payload.hasGeminiKey === 'boolean') {
+        return {
+          status: payload.status,
+          hasGeminiKey: payload.hasGeminiKey,
+          ...(payload.provider === 'gemini' || payload.provider === 'openai' ||
+              payload.provider === 'anthropic' || payload.provider === 'huggingface'
+            ? { provider: payload.provider }
+            : {}),
+          ...(typeof payload.hasAiKey === 'boolean' ? { hasAiKey: payload.hasAiKey } : {}),
+        };
+      }
     }
     return { status: 'offline', hasGeminiKey: false };
   } catch {
@@ -76,7 +119,7 @@ export async function checkServerHealth(): Promise<{
 export async function getAiSettings(): Promise<ApiResponse<AiSettings>> {
   try {
     const response = await fetch('/api/settings');
-    return await response.json();
+    return await decodeApiResponse<AiSettings>(response);
   } catch {
     return { success: false, error: 'Could not reach server settings.' };
   }
@@ -86,8 +129,7 @@ export async function getProviderModels(provider: AiProvider, apiKey?: string): 
   try {
     if (apiKey) return postJson<ModelOption[]>('/api/settings/models', { provider, apiKey });
     const response = await fetch(`/api/settings/models?provider=${provider}`);
-    const data = await response.json();
-    return response.ok ? data : { success: false, error: data.error || 'Could not load provider models.' };
+    return await decodeApiResponse<ModelOption[]>(response);
   } catch {
     return { success: false, error: 'Could not load provider models.' };
   }

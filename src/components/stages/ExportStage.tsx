@@ -8,6 +8,8 @@ import {
   exportScenesAsCSV,
   openPrintableStoryboard,
 } from '../../utils/exportUtils';
+import { parseProjectBackup, serializeProjectBackup } from '../../utils/projectBackup';
+import { loadProjectVideo } from '../../services/storage';
 import {
   Download,
   FileText,
@@ -22,7 +24,7 @@ import {
 
 interface ExportStageProps {
   project: Project;
-  onImportProject: (imported: Project) => void;
+  onImportProject: (imported: Project) => Promise<boolean>;
 }
 
 export const ExportStage: React.FC<ExportStageProps> = ({
@@ -63,29 +65,45 @@ export const ExportStage: React.FC<ExportStageProps> = ({
     downloadText(json, `${slug}_scenes.json`, 'application/json');
   };
 
-  const handleExportProjectBackup = () => {
-    const json = JSON.stringify(project, null, 2);
-    downloadText(json, `${slug}_scenecraft_project.json`, 'application/json');
+  const handleExportProjectBackup = async () => {
+    try {
+      const videoAsset = project.assembledVideoAssetId
+        ? await loadProjectVideo(project.assembledVideoAssetId)
+        : null;
+      const json = await serializeProjectBackup(project, videoAsset);
+      downloadText(json, `${slug}_scenecraft_project.json`, 'application/json');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Could not create the complete project backup.');
+    }
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (file.size > 200 * 1024 * 1024) {
+      alert('Project backup is larger than 200 MB. Download very large rendered video files separately before exporting smaller project assets.');
+      e.target.value = '';
+      return;
+    }
 
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
         const raw = event.target?.result as string;
-        const parsed = JSON.parse(raw);
-        if (parsed.metadata && parsed.script && parsed.scenes) {
-          onImportProject(parsed);
-          alert('Project imported successfully!');
-        } else {
-          alert('Invalid SceneCraft project JSON format.');
-        }
-      } catch {
-        alert('Failed to parse project JSON file.');
+        const parsed = parseProjectBackup(raw);
+        void onImportProject(parsed).then((imported) => {
+          if (imported) alert('Project imported successfully!');
+        }).catch((error: unknown) => {
+          alert(error instanceof Error ? error.message : 'Could not import this project backup.');
+        });
+      } catch (error) {
+        alert(error instanceof Error ? error.message : 'Could not import this project backup.');
       }
+      e.target.value = '';
+    };
+    reader.onerror = () => {
+      alert('Could not read the selected project backup.');
+      e.target.value = '';
     };
     reader.readAsText(file);
   };

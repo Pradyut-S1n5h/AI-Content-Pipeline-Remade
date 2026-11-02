@@ -4,6 +4,7 @@ import {
   assembleVideoFromScenes,
   VideoRenderProgress,
 } from '../../utils/videoRenderer';
+import { loadProjectVideo } from '../../services/storage';
 import { downloadBlob } from '../../utils/exportUtils';
 import {
   Play,
@@ -22,7 +23,7 @@ import {
 
 interface VideoStageProps {
   project: Project;
-  onUpdateProjectVideo: (videoUrl: string) => void;
+  onUpdateProjectVideo: (video: Blob) => Promise<string>;
   onProceedToExport: () => void;
 }
 
@@ -36,9 +37,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   const [renderProgress, setRenderProgress] = useState<VideoRenderProgress | null>(null);
   const [isRendering, setIsRendering] = useState(false);
   const [renderedBlob, setRenderedBlob] = useState<Blob | null>(null);
-  const [renderedUrl, setRenderedUrl] = useState<string | null>(
-    project.assembledVideoUrl || null
-  );
+  const [renderedUrl, setRenderedUrl] = useState<string | null>(project.assembledVideoUrl || null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const scenes = project.scenes || [];
@@ -47,8 +46,50 @@ export const VideoStage: React.FC<VideoStageProps> = ({
   // Playback timer ref
   const playbackTimerRef = useRef<NodeJS.Timeout | null>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const renderAbortRef = useRef<AbortController | null>(null);
+  const renderedUrlRef = useRef<string | null>(project.assembledVideoUrl || null);
+  const knownAssetIdRef = useRef<string | null>(null);
 
   const currentScene = validScenes[currentSceneIdx] || validScenes[0];
+
+  useEffect(() => {
+    let cancelled = false;
+    const assetId = project.assembledVideoAssetId;
+    if (assetId && knownAssetIdRef.current === assetId) return;
+
+    const previousUrl = renderedUrlRef.current;
+    if (previousUrl?.startsWith('blob:')) URL.revokeObjectURL(previousUrl);
+    renderedUrlRef.current = null;
+    setRenderedUrl(null);
+    setRenderedBlob(null);
+    knownAssetIdRef.current = null;
+
+    if (!assetId) {
+      if (project.assembledVideoUrl && !project.assembledVideoUrl.startsWith('blob:')) {
+        renderedUrlRef.current = project.assembledVideoUrl;
+        setRenderedUrl(project.assembledVideoUrl);
+      }
+      return () => { cancelled = true; };
+    }
+
+    void loadProjectVideo(assetId).then((blob) => {
+      if (cancelled) return;
+      if (!blob) {
+        setErrorMessage('The project refers to a saved video that is no longer available. Re-render the video.');
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      renderedUrlRef.current = url;
+      knownAssetIdRef.current = assetId;
+      setRenderedBlob(blob);
+      setRenderedUrl(url);
+    }).catch((error: unknown) => {
+      if (!cancelled) {
+        setErrorMessage(error instanceof Error ? error.message : 'Could not restore the saved video.');
+      }
+    });
+    return () => { cancelled = true; };
+  }, [project.metadata.id, project.assembledVideoAssetId, project.assembledVideoUrl]);
 
   // Stop playback when unmounting or paused
   const stopPlayback = () => {
@@ -65,7 +106,13 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
   useEffect(() => {
     return () => {
-      stopPlayback();
+      if (renderedUrlRef.current?.startsWith('blob:')) URL.revokeObjectURL(renderedUrlRef.current);
+      if (playbackTimerRef.current) clearTimeout(playbackTimerRef.current);
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
+      }
+      renderAbortRef.current?.abort();
     };
   }, []);
 
@@ -78,10 +125,14 @@ export const VideoStage: React.FC<VideoStageProps> = ({
 
     // Play scene audio if available
     if (scene?.audioUrl) {
-      if (currentAudioRef.current) currentAudioRef.current.pause();
       const aud = new Audio(scene.audioUrl);
-      aud.play().catch(() => {});
       currentAudioRef.current = aud;
+      aud.play().catch(() => {
+        if (currentAudioRef.current === aud) {
+          currentAudioRef.current = null;
+          setErrorMessage(`Audio for scene ${scene.sceneNumber} could not be played.`);
+        }
+      });
     }
 
     playbackTimerRef.current = setTimeout(() => {
@@ -97,6 +148,10 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     return () => {
       if (playbackTimerRef.current) {
         clearTimeout(playbackTimerRef.current);
+      }
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
       }
     };
   }, [isPlayingAnimatic, currentSceneIdx, validScenes]);
@@ -128,38 +183,61 @@ export const VideoStage: React.FC<VideoStageProps> = ({
     }
 
     stopPlayback();
+    const controller = new AbortController();
+    renderAbortRef.current = controller;
     setIsRendering(true);
     setErrorMessage(null);
 
     try {
+      const dimensions = {
+        '16:9': { width: 1280, height: 720 },
+        '9:16': { width: 720, height: 1280 },
+        '1:1': { width: 1080, height: 1080 },
+        '4:3': { width: 960, height: 720 },
+      }[project.metadata.aspectRatio];
       const blob = await assembleVideoFromScenes(
         validScenes,
         (progress) => {
           setRenderProgress(progress);
         },
         {
-          width: 1280,
-          height: 720,
+          ...dimensions,
           fps: 30,
           includeTitles: true,
+          signal: controller.signal,
         }
       );
 
+      const previousUrl = renderedUrlRef.current;
+      if (previousUrl?.startsWith('blob:')) URL.revokeObjectURL(previousUrl);
       const url = URL.createObjectURL(blob);
+      renderedUrlRef.current = url;
       setRenderedBlob(blob);
       setRenderedUrl(url);
-      onUpdateProjectVideo(url);
+      try {
+        knownAssetIdRef.current = await onUpdateProjectVideo(blob);
+      } catch (error) {
+        setErrorMessage(error instanceof Error
+          ? `Video rendered, but could not be saved with the project: ${error.message}`
+          : 'Video rendered, but could not be saved with the project.');
+      }
     } catch (err: any) {
-      console.error('Video assembly failed:', err);
-      setErrorMessage(err.message || 'Video assembly failed.');
+      if (err instanceof Error && err.message === 'Video rendering cancelled.') {
+        setErrorMessage('Video rendering cancelled. Your project assets are unchanged.');
+      } else {
+        console.error('Video assembly failed:', err);
+        setErrorMessage(err instanceof Error ? err.message : 'Video assembly failed.');
+      }
     } finally {
+      renderAbortRef.current = null;
       setIsRendering(false);
     }
   };
 
   const handleDownloadVideo = () => {
     if (!renderedBlob && !renderedUrl) return;
-    const filename = `${project.metadata.title.toLowerCase().replace(/\s+/g, '_')}_final.webm`;
+    const extension = renderedBlob?.type.startsWith('video/mp4') ? 'mp4' : 'webm';
+    const filename = `${project.metadata.title.toLowerCase().replace(/\s+/g, '_')}_final.${extension}`;
     if (renderedBlob) {
       downloadBlob(renderedBlob, filename);
     } else if (renderedUrl) {
@@ -183,7 +261,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             <span>Video Timeline & Assembly</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Real animatic player with Ken Burns movement, audio sync, and canvas video export.
+            Real animatic player with Ken Burns movement and scene audio. Exports MP4 when the browser supports it, otherwise WebM; rendered files are saved in the project database.
           </p>
         </div>
 
@@ -205,6 +283,15 @@ export const VideoStage: React.FC<VideoStageProps> = ({
               </>
             )}
           </button>
+          {isRendering && (
+            <button
+              type="button"
+              onClick={() => renderAbortRef.current?.abort()}
+              className="rounded border border-zinc-700 px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-800"
+            >
+              Cancel render
+            </button>
+          )}
 
           <button
             onClick={onProceedToExport}
@@ -265,7 +352,7 @@ export const VideoStage: React.FC<VideoStageProps> = ({
             <div>
               <span className="font-semibold text-emerald-300">Video Assembly Ready: </span>
               <span className="text-zinc-300">
-                Storyboard animatic assembled ({validScenes.length} scenes, {totalRuntimeSec}s total runtime).
+                {renderedBlob?.type.startsWith('video/mp4') ? 'MP4' : 'WebM'} animatic assembled ({validScenes.length} scenes, {totalRuntimeSec}s total runtime).
               </span>
             </div>
           </div>

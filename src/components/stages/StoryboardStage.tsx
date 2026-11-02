@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Project, Scene } from '../../types';
+import { Project, Scene, SceneUpdate } from '../../types';
 import { generateImageApi } from '../../services/api';
+import { AiProvider, PROVIDER_CAPABILITIES } from '../../services/aiProviders';
 import {
   Image as ImageIcon,
   Sparkles,
@@ -18,9 +19,10 @@ import {
 
 interface StoryboardStageProps {
   project: Project;
-  onUpdateScenes: (scenes: Scene[]) => void;
+  onUpdateScenes: (update: SceneUpdate) => void;
   onProceedToAudio: () => void;
   hasGeminiKey: boolean;
+  activeProvider: AiProvider;
 }
 
 export const StoryboardStage: React.FC<StoryboardStageProps> = ({
@@ -28,65 +30,68 @@ export const StoryboardStage: React.FC<StoryboardStageProps> = ({
   onUpdateScenes,
   onProceedToAudio,
   hasGeminiKey,
+  activeProvider,
 }) => {
   const [activeSceneId, setActiveSceneId] = useState<string | null>(null);
   const [isBatchGenerating, setIsBatchGenerating] = useState(false);
   const [inspectImageScene, setInspectImageScene] = useState<Scene | null>(null);
 
   const scenes = project.scenes || [];
+  const imageGenerationSupported = PROVIDER_CAPABILITIES[activeProvider].image;
 
   const handleGenerateSceneImage = async (sceneId: string) => {
+    if (!imageGenerationSupported) return;
     const target = scenes.find((s) => s.id === sceneId);
     if (!target) return;
 
     // Set generating status
-    const updated = scenes.map((s) =>
-      s.id === sceneId ? { ...s, imageStatus: 'generating' as const, imageError: undefined } : s
-    );
-    onUpdateScenes(updated);
+    onUpdateScenes((current) => current.map((scene) =>
+      scene.id === sceneId ? { ...scene, imageStatus: 'generating', imageError: undefined } : scene
+    ));
 
+    const referenceImages = project.bible.characters
+      .filter((character) => target.characters.includes(character.name))
+      .flatMap((character) => character.referenceImages || [])
+      .slice(0, 4);
     const res = await generateImageApi({
       prompt: target.imagePrompt || `${target.cameraDirection}, ${target.description}, ${project.metadata.visualStyle}`,
       aspectRatio: project.metadata.aspectRatio,
       sceneId: target.id,
+      ...(referenceImages.length ? { referenceImages } : {}),
     });
 
     if (res.success && res.data?.imageUrl) {
-      const finished = scenes.map((s) =>
-        s.id === sceneId
-          ? {
-              ...s,
-              imageUrl: res.data!.imageUrl,
-              imageStatus: 'completed' as const,
-              imageError: undefined,
-            }
-          : s
-      );
-      onUpdateScenes(finished);
+      onUpdateScenes((current) => current.map((scene) =>
+        scene.id === sceneId
+          ? { ...scene, imageUrl: res.data!.imageUrl, imageStatus: 'completed', imageError: undefined }
+          : scene
+      ));
     } else {
-      const failed = scenes.map((s) =>
-        s.id === sceneId
+      onUpdateScenes((current) => current.map((scene) =>
+        scene.id === sceneId
           ? {
-              ...s,
-              imageStatus: 'failed' as const,
-              imageError:
-                res.error ||
+              ...scene,
+              imageStatus: 'failed',
+              imageError: res.error ||
                 'Image generation failed. Ensure your Gemini API key is valid or click "Use Cinematic Sample" to proceed.',
             }
-          : s
-      );
-      onUpdateScenes(failed);
+          : scene
+      ));
     }
   };
 
   const handleBatchGenerate = async () => {
+    if (!imageGenerationSupported) return;
     setIsBatchGenerating(true);
-    for (const scene of scenes) {
-      if (!scene.imageUrl || scene.imageStatus === 'failed') {
-        await handleGenerateSceneImage(scene.id);
+    try {
+      for (const scene of scenes) {
+        if ((!scene.imageUrl || scene.imageStatus === 'failed') && scene.imageStatus !== 'generating') {
+          await handleGenerateSceneImage(scene.id);
+        }
       }
+    } finally {
+      setIsBatchGenerating(false);
     }
-    setIsBatchGenerating(false);
   };
 
   const handleDownloadImage = (scene: Scene) => {
@@ -112,17 +117,11 @@ export const StoryboardStage: React.FC<StoryboardStageProps> = ({
     const sIdx = scenes.findIndex((s) => s.id === sceneId);
     const chosen = samplePool[sIdx % samplePool.length];
 
-    const updated = scenes.map((s) =>
-      s.id === sceneId
-        ? {
-            ...s,
-            imageUrl: chosen,
-            imageStatus: 'completed' as const,
-            imageError: undefined,
-          }
-        : s
-    );
-    onUpdateScenes(updated);
+    onUpdateScenes((current) => current.map((scene) =>
+      scene.id === sceneId
+        ? { ...scene, imageUrl: chosen, imageStatus: 'completed', imageError: undefined }
+        : scene
+    ));
   };
 
   const completedImagesCount = scenes.filter((s) => s.imageUrl).length;
@@ -136,14 +135,14 @@ export const StoryboardStage: React.FC<StoryboardStageProps> = ({
             <span>Visual Storyboard Studio</span>
           </h1>
           <p className="text-xs text-zinc-400 mt-1">
-            Generate cinematic frames using Gemini 3.1 Flash Lite Image with consistent character and location bible prompts.
+            Generate frames with {activeProvider === 'openai' ? 'OpenAI gpt-image-1' : activeProvider === 'gemini' ? 'Gemini Flash Image' : `${activeProvider} (image generation unavailable)`}. Character reference images are included when supported.
           </p>
         </div>
 
         <div className="flex items-center gap-2.5">
           <button
             onClick={handleBatchGenerate}
-            disabled={isBatchGenerating || scenes.length === 0}
+            disabled={!imageGenerationSupported || isBatchGenerating || scenes.length === 0 || scenes.some((scene) => scene.imageStatus === 'generating')}
             className="flex items-center gap-2 bg-amber-400 hover:bg-amber-300 disabled:opacity-50 text-zinc-950 font-semibold px-4 py-2 rounded text-xs transition-colors"
           >
             {isBatchGenerating ? (
@@ -171,6 +170,12 @@ export const StoryboardStage: React.FC<StoryboardStageProps> = ({
         </div>
       </div>
 
+      {!imageGenerationSupported && (
+        <div role="status" className="rounded border border-amber-900/70 bg-amber-950/30 px-4 py-3 text-xs text-amber-200">
+          {activeProvider} does not provide image generation in SceneCraft. Choose Gemini or OpenAI in AI Settings; existing artwork and sample art remain available.
+        </div>
+      )}
+
       {/* Progress & Stats Bar */}
       <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
         <div className="flex items-center gap-3">
@@ -182,7 +187,11 @@ export const StoryboardStage: React.FC<StoryboardStageProps> = ({
         <div className="flex items-center gap-4 text-zinc-400">
           <span>Aspect Ratio: {project.metadata.aspectRatio}</span>
           <span>·</span>
-          <span>Format: Gemini Flash Lite Image</span>
+          <span>
+            Format: {PROVIDER_CAPABILITIES[activeProvider].image
+              ? activeProvider === 'openai' ? 'OpenAI gpt-image-1' : 'Gemini Flash Image'
+              : 'Unavailable for selected provider'}
+          </span>
         </div>
       </div>
 
@@ -247,6 +256,7 @@ export const StoryboardStage: React.FC<StoryboardStageProps> = ({
                       <div className="flex items-center justify-center gap-2 pt-1">
                         <button
                           onClick={() => handleGenerateSceneImage(scene.id)}
+                          disabled={!imageGenerationSupported}
                           className="text-[11px] bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-2.5 py-1 rounded"
                         >
                           Retry
@@ -269,6 +279,7 @@ export const StoryboardStage: React.FC<StoryboardStageProps> = ({
                       <div className="flex items-center justify-center gap-2">
                         <button
                           onClick={() => handleGenerateSceneImage(scene.id)}
+                          disabled={!imageGenerationSupported}
                           className="flex items-center gap-1.5 bg-amber-400 hover:bg-amber-300 text-zinc-950 font-semibold px-3 py-1.5 rounded text-xs transition-colors"
                         >
                           <Sparkles className="w-3 h-3" />
@@ -309,13 +320,18 @@ export const StoryboardStage: React.FC<StoryboardStageProps> = ({
                   <p className="text-[11px] text-zinc-400 line-clamp-2 leading-relaxed">
                     {scene.description || scene.actions}
                   </p>
+                  {scene.imageError && isFailed && (
+                    <p role="alert" className="rounded border border-rose-900/70 bg-rose-950/40 p-2 text-[10px] leading-relaxed text-rose-200">
+                      Regeneration failed; previous artwork is retained. {scene.imageError}
+                    </p>
+                  )}
 
                   <div className="pt-2 border-t border-zinc-800/80 flex items-center justify-between text-[11px] text-zinc-500">
                     <span className="truncate max-w-[180px]">{scene.cameraDirection}</span>
                     {scene.imageUrl && (
                       <button
                         onClick={() => handleGenerateSceneImage(scene.id)}
-                        disabled={isGenerating}
+                        disabled={isGenerating || !imageGenerationSupported}
                         className="text-zinc-400 hover:text-amber-400 transition-colors flex items-center gap-1"
                         title="Regenerate this frame"
                       >

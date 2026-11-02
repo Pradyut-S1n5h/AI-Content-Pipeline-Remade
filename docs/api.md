@@ -1,6 +1,6 @@
 # SceneCraft API Reference
 
-All AI operations in SceneCraft are handled by backend Express endpoints in `server.ts`. Text generation supports Gemini, OpenAI, Anthropic, and Hugging Face. Web-entered credentials remain in server memory and are associated with an `HttpOnly` browser-session cookie. Keys are never returned by API endpoints.
+All AI operations in SceneCraft are handled by backend Express endpoints in `server.ts`. Text generation supports Gemini, OpenAI, Anthropic, and Hugging Face. Gemini and OpenAI also provide image and speech adapters. Web-entered credentials are associated with an `HttpOnly` browser-session cookie; they are encrypted at rest when `SCENECRAFT_KEY_ENCRYPTION_KEY` is configured and are never returned by API endpoints.
 
 ---
 
@@ -23,24 +23,23 @@ Returns server readiness and whether the active browser session's selected provi
 ```
 
 ### `GET /api/settings`
-Returns the selected provider, model, thinking level, supported model lists, and whether a key is configured. The key value is never returned; `maskedKey` is a fixed mask only.
+Returns the selected provider/model, thinking level, media capabilities, whether encrypted key persistence is configured, and per-provider key source (`session`, `persistent`, `environment`, or `none`). The key value is never returned; the legacy `maskedKey` field is only a fixed mask.
 
 ### `GET /api/settings/models?provider=gemini`
-Fetches Gemini models available to the current server-side key and returns only models advertising `generateContent`. Newer text models are therefore selectable when enabled for the key. Without a key, the maintained known model list is returned. Unknown models do not receive a thinking parameter unless support is explicitly configured.
+Fetches text models available to the current server-side key. Gemini models must advertise `generateContent` and media/embedding models are filtered out. Without a key, the maintained known model list is returned. Thinking controls are enabled only for models whose provider-specific mapping is explicitly known.
 
 ### `POST /api/settings`
-Saves session-scoped settings. Accepts `provider` (`gemini`, `openai`, `anthropic`, or `huggingface`), a compatible `model`, `thinkingLevel` (`low`, `medium`, or `high`), and an optional `apiKey`. A key is held in server memory only.
+Saves settings for the current browser session. Accepts `provider` (`gemini`, `openai`, `anthropic`, or `huggingface`), a compatible `model`, `thinkingLevel` (`low`, `medium`, or `high`), and an optional `apiKey`. Keys are encrypted with AES-256-GCM in the server vault when the independently managed `SCENECRAFT_KEY_ENCRYPTION_KEY` is set; otherwise, they are memory-only.
 
 ### `POST /api/settings/test`
-Checks credentials with the provider's model-list endpoint using `GET`; it does not generate content or incur generation charges. An optional `apiKey` can be tested before saving.
+Checks credentials with the provider's model-list endpoint using `GET`; it does not generate content. An optional `apiKey` can be tested before saving. Without a key in the request, it checks that provider's session key or environment key even when another provider is currently selected.
 
-### `GET /api/settings/models?provider=gemini`
-Lists provider text models enabled for the active key. Use `POST /api/settings/models` with `{ "provider": "gemini", "apiKey": "..." }` to refresh with an unsaved key; credentials are sent in the request body, never the URL or response. Gemini results filter out image, audio, embedding, and other non-text models. Models such as `gemini-3.8-flash` appear only if the provider lists them for that key. Hugging Face includes Qwen models through its OpenAI-compatible router.
+Use `POST /api/settings/models` with `{ "provider": "gemini", "apiKey": "..." }` to refresh with an unsaved key; credentials are sent in the request body, never the URL or response. Dynamically discovered models are validated against the catalog for that provider key before they can be saved or used.
 
 ### `POST /api/settings/key/remove`
-Removes the selected provider's key from the current server session. Environment-configured keys are not removed.
+Removes the selected provider's web-entered key from the current session and encrypted vault. Environment-configured keys are not removed.
 
-Web-entered keys/settings are lost on server restart. Generation is capped at 10 requests per minute and 100 per day per session.
+Encrypted provider keys/settings expire 30 days after the last settings save. The browser cookie is HttpOnly, SameSite=Strict, and Secure in production; the server allows at most 500 simultaneous sessions. Without the encryption secret, web-entered keys are memory-only and do not survive restart. Generation is capped at 10 requests per minute and 100 per day per session.
 
 ---
 
@@ -205,13 +204,14 @@ Re-synthesizes an ultra-detailed image prompt for an individual scene using the 
 ## Media Generation Endpoints
 
 ### `POST /api/ai/generate-image`
-Generates a storyboard scene image using Gemini `gemini-2.5-flash-image` with image output explicitly requested. This media model is separate from the text-model selector. Image generation is not available through the OpenAI provider selection.
+Generates an image using the active provider's media adapter: Gemini `gemini-2.5-flash-image` or OpenAI `gpt-image-1`. Anthropic and Hugging Face do not implement image generation in SceneCraft. Up to four PNG/JPEG/WebP reference images may be supplied. References are attached through Gemini multimodal input or OpenAI's image-edit endpoint. The media model is separate from the text-model selector.
 
 **Request Body**:
 ```json
 {
   "prompt": "Cinematic anamorphic 35mm film still of Maya Lin seated before starfield...",
-  "aspectRatio": "16:9"
+  "aspectRatio": "16:9",
+  "referenceImages": ["data:image/png;base64,..."]
 }
 ```
 
@@ -229,7 +229,7 @@ Generates a storyboard scene image using Gemini `gemini-2.5-flash-image` with im
 ---
 
 ### `POST /api/ai/audio-tts`
-Synthesizes speech audio for character dialogue or scene narration using Gemini `gemini-2.5-flash-preview-tts`. Speech generation is not available through the OpenAI provider selection.
+Synthesizes speech for character dialogue or narration using Gemini `gemini-2.5-flash-preview-tts` or OpenAI `gpt-4o-mini-tts`, depending on the active provider. Gemini voices are Kore, Puck, Charon, Fenrir, and Zephyr. OpenAI voices use the provider's documented presets. Anthropic and Hugging Face do not implement speech synthesis in SceneCraft.
 
 **Request Body**:
 ```json
@@ -250,3 +250,12 @@ Synthesizes speech audio for character dialogue or scene narration using Gemini 
   }
 }
 ```
+
+Gemini PCM audio is wrapped by the server in a 24kHz, 16-bit mono RIFF/WAV container; OpenAI is requested to return WAV. Duration is calculated from the WAV data size.
+
+## Project Storage and Video Notes
+
+- Project records/media are stored in IndexedDB; legacy localStorage records are migrated on first database open. The active-project pointer remains in localStorage. Browser quota remains applicable.
+- Project backup files use `{ "format": "scenecraft-project", "version": 1, "project": ... }`. Imports validate project metadata, scenes, and world-bible entries. Previous unwrapped backup files remain supported; unsupported future versions and malformed files are rejected.
+- Image/audio data URIs, screenplay history, character references, and persisted rendered video are included in project backups. Video is stored as a local IndexedDB Blob; its object URL is recreated when the project is reopened.
+- Video rendering selects MP4 only when `MediaRecorder.isTypeSupported` confirms a supported MP4 MIME type; otherwise it selects WebM. It paces scene duration at 30fps and mixes generated WAV clips at scene boundaries.

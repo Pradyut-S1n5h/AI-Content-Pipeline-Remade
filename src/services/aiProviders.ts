@@ -2,6 +2,18 @@ export type AiProvider = 'gemini' | 'openai' | 'anthropic' | 'huggingface';
 export type ThinkingLevel = 'low' | 'medium' | 'high';
 export const GEMINI_IMAGE_MODEL = 'gemini-2.5-flash-image';
 
+export const PROVIDER_CAPABILITIES: Record<AiProvider, {
+  text: true;
+  image: boolean;
+  speech: boolean;
+  referenceImages: boolean;
+}> = {
+  gemini: { text: true, image: true, speech: true, referenceImages: true },
+  openai: { text: true, image: true, speech: true, referenceImages: true },
+  anthropic: { text: true, image: false, speech: false, referenceImages: false },
+  huggingface: { text: true, image: false, speech: false, referenceImages: false },
+};
+
 export interface ModelOption {
   id: string;
   label: string;
@@ -145,7 +157,7 @@ function providerName(provider: AiProvider): string {
   }[provider];
 }
 
-function errorForStatus(status: number, provider: AiProvider, body: string): AiProviderError {
+export function errorForStatus(status: number, provider: AiProvider, body: string): AiProviderError {
   let description = '';
   try {
     const parsed = JSON.parse(body);
@@ -183,7 +195,7 @@ function errorForStatus(status: number, provider: AiProvider, body: string): AiP
   return new AiProviderError('The AI provider could not complete this request.', status, 'provider_error');
 }
 
-async function requestWithRetry(
+export async function requestWithRetry(
   url: string,
   init: RequestInit,
   provider: AiProvider,
@@ -213,7 +225,7 @@ async function requestWithRetry(
   throw new AiProviderError('The AI provider is unavailable.', 503, 'provider_outage');
 }
 
-async function readResponseBody(response: Response): Promise<string> {
+export async function readResponseBody(response: Response): Promise<string> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([

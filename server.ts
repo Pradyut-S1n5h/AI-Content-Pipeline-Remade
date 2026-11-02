@@ -19,6 +19,7 @@ import {
   GenerateTextOptions,
   GEMINI_IMAGE_MODEL,
   PROVIDER_MODELS,
+  PROVIDER_CAPABILITIES,
   ThinkingLevel,
   generateText,
   listProviderModels,
@@ -27,11 +28,18 @@ import {
   validateJsonSchema,
   validateModel,
 } from './src/services/aiProviders';
+import { pcm16ToWav } from './src/utils/wav';
+import { createKeyVault } from './src/services/keyVault';
+import { generateOpenAiImage, generateOpenAiSpeech } from './src/services/serverMediaProviders';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const keyVault = createKeyVault(
+  process.env.SCENECRAFT_KEY_ENCRYPTION_KEY,
+  process.env.SCENECRAFT_KEY_STORE_PATH || path.resolve(__dirname, '.scenecraft/keys.json')
+);
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -39,37 +47,74 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-const sessions = new Map<string, {
+interface ServerSession {
   provider?: AiProvider;
   model?: string;
   thinkingLevel?: ThinkingLevel;
   keys: Partial<Record<AiProvider, string>>;
+  persistedKeys: Set<AiProvider>;
   availableModels: Partial<Record<AiProvider, { ids: string[]; keyDigest: string }>>;
   generationTimes: number[];
   lastUsed: number;
-}>();
+}
+const sessions = new Map<string, ServerSession>();
+let lastSessionCleanup = 0;
+
+function requestSessionId(req: Request): string | undefined {
+  const cookie = req.headers.cookie?.split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith('ai_session='));
+  const sessionId = cookie?.slice('ai_session='.length);
+  return sessionId && /^[\da-f-]{36}$/i.test(sessionId) ? sessionId : undefined;
+}
 
 app.use((req: Request, res: Response, next) => {
-  const cookie = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='));
-  let sessionId = cookie?.slice('ai_session='.length);
-  if (!sessionId || !sessions.has(sessionId)) {
-    sessionId = randomUUID();
-    res.setHeader('Set-Cookie', `ai_session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
-    sessions.set(sessionId, { keys: {}, availableModels: {}, generationTimes: [], lastUsed: Date.now() });
-  }
-  const session = sessions.get(sessionId)!;
-  session.lastUsed = Date.now();
-  if (sessions.size > 500) {
+  const now = Date.now();
+  if (now - lastSessionCleanup > 60_000 || sessions.size >= 500) {
     for (const [id, value] of sessions) {
-      if (Date.now() - value.lastUsed > 86_400_000) sessions.delete(id);
+      if (now - value.lastUsed > 86_400_000) sessions.delete(id);
+    }
+    lastSessionCleanup = now;
+  }
+  let sessionId = requestSessionId(req);
+  if (!sessionId || !sessions.has(sessionId)) {
+    try {
+      if (sessionId && keyVault.enabled) {
+        const restored = keyVault.load(sessionId);
+        if (restored) {
+          sessions.set(sessionId, {
+            ...restored.settings,
+            keys: restored.keys,
+            persistedKeys: new Set(Object.keys(restored.keys) as AiProvider[]),
+            availableModels: {},
+            generationTimes: [],
+            lastUsed: now,
+          });
+        }
+      }
+    } catch (error) {
+      console.error('[AI] Provider settings could not be restored from the encrypted vault.');
+      return res.status(503).json({
+        success: false,
+        error: 'Saved provider credentials could not be restored. Check the server key-vault configuration and file permissions.',
+      });
+    }
+    if (!sessionId || !sessions.has(sessionId)) {
+      if (sessions.size >= 500) {
+        return res.status(503).json({ success: false, error: 'The server has reached its temporary browser-session limit. Try again later.' });
+      }
+      sessionId = randomUUID();
+      sessions.set(sessionId, { keys: {}, persistedKeys: new Set(), availableModels: {}, generationTimes: [], lastUsed: now });
     }
   }
+  const session = sessions.get(sessionId)!;
+  session.lastUsed = now;
+  res.setHeader('Set-Cookie', `ai_session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
   next();
 });
 
 function getAiSettings(req: Request) {
-  const cookie = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='));
-  const sessionId = cookie?.slice('ai_session='.length);
+  const sessionId = requestSessionId(req);
   const session = sessionId ? sessions.get(sessionId) : undefined;
   const envProvider = isAiProvider(process.env.AI_PROVIDER) ? process.env.AI_PROVIDER : 'gemini';
   const provider = session?.provider || envProvider;
@@ -77,13 +122,24 @@ function getAiSettings(req: Request) {
   const envModel = process.env.AI_MODEL || defaultModel;
   const model = session?.model || (validateModel(provider, envModel) ? envModel : defaultModel);
   const key = session?.keys[provider] || getEnvironmentKey(provider);
-  const keySource = session?.keys[provider] ? 'session' : key ? 'environment' : 'none';
+  const sourceFor = (keyProvider: AiProvider): 'session' | 'persistent' | 'environment' | 'none' =>
+    session?.keys[keyProvider]
+      ? session.persistedKeys.has(keyProvider) ? 'persistent' : 'session'
+      : getEnvironmentKey(keyProvider) ? 'environment' : 'none';
+  const keySource = sourceFor(provider);
+  const keySources: Record<AiProvider, 'session' | 'persistent' | 'environment' | 'none'> = {
+    gemini: sourceFor('gemini'),
+    openai: sourceFor('openai'),
+    anthropic: sourceFor('anthropic'),
+    huggingface: sourceFor('huggingface'),
+  };
   return {
     provider,
     model,
     thinkingLevel: session?.thinkingLevel || 'medium',
     key,
     keySource,
+    keySources,
     publicSettings: {
       provider,
       model,
@@ -92,12 +148,43 @@ function getAiSettings(req: Request) {
       keySource,
       maskedKey: key ? '********' : null,
       models: PROVIDER_MODELS,
+      capabilities: PROVIDER_CAPABILITIES[provider],
+      keyPersistenceAvailable: keyVault.enabled,
     },
   };
 }
 
 function isAiProvider(value: unknown): value is AiProvider {
   return value === 'gemini' || value === 'openai' || value === 'anthropic' || value === 'huggingface';
+}
+
+function isNonEmptyText(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength;
+}
+
+function isOptionalText(value: unknown, maxLength: number): boolean {
+  return value === undefined || (typeof value === 'string' && value.length <= maxLength);
+}
+
+function validateReferenceImages(value: unknown): Array<{ mimeType: string; data: string }> {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 4) {
+    throw new AiProviderError('Choose no more than four reference images per scene.', 400, 'invalid_reference_images');
+  }
+  const references = value.map((image) => {
+    if (typeof image !== 'string' || image.length > 3_000_000) {
+      throw new AiProviderError('Each reference image must be smaller than 2.2 MB.', 413, 'reference_image_too_large');
+    }
+    const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(image);
+    if (!match) {
+      throw new AiProviderError('Reference images must be PNG, JPEG, or WebP data images.', 400, 'invalid_reference_images');
+    }
+    return { mimeType: match[1], data: match[2] };
+  });
+  if (references.reduce((size, image) => size + image.data.length, 0) > 10_000_000) {
+    throw new AiProviderError('The combined reference images are too large. Use smaller images or fewer references.', 413, 'reference_images_too_large');
+  }
+  return references;
 }
 
 function getEnvironmentKey(provider: AiProvider): string {
@@ -110,9 +197,31 @@ function getEnvironmentKey(provider: AiProvider): string {
   return keys[provider] || '';
 }
 
+function persistSessionKeys(sessionId: string, session: ServerSession): void {
+  if (!keyVault.enabled) return;
+  const keys: Partial<Record<AiProvider, string>> = {};
+  for (const [provider, value] of Object.entries(session.keys)) {
+    if (isAiProvider(provider) && typeof value === 'string' && value) keys[provider] = value;
+  }
+  if (Object.keys(keys).length === 0) {
+    keyVault.remove(sessionId);
+    session.persistedKeys.clear();
+    return;
+  }
+  keyVault.save(sessionId, {
+    keys,
+    settings: {
+      ...(session.provider ? { provider: session.provider } : {}),
+      ...(session.model ? { model: session.model } : {}),
+      ...(session.thinkingLevel ? { thinkingLevel: session.thinkingLevel } : {}),
+    },
+  });
+  session.persistedKeys = new Set(Object.keys(keys) as AiProvider[]);
+}
+
 async function loadProviderModels(req: Request, provider: AiProvider, key: string) {
   const models = key ? await listProviderModels(provider, key) : PROVIDER_MODELS[provider];
-  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const sessionId = requestSessionId(req);
   const session = sessionId ? sessions.get(sessionId) : undefined;
   if (key && session) {
     session.availableModels[provider] = {
@@ -132,7 +241,7 @@ function sendAiError(res: Response, error: unknown) {
 }
 
 function consumeGenerationBudget(req: Request) {
-  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const sessionId = requestSessionId(req);
   const session = sessionId ? sessions.get(sessionId) : undefined;
   if (!session) throw new AiProviderError('AI session is unavailable. Refresh the page and try again.', 503, 'session_unavailable');
   const now = Date.now();
@@ -159,9 +268,22 @@ async function generateTextForRequest(
   const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
   const session = sessionId ? sessions.get(sessionId) : undefined;
   const modelCache = session?.availableModels[settings.provider];
-  const allowedModels = modelCache?.keyDigest === createHash('sha256').update(settings.key).digest('hex')
+  let allowedModels = modelCache?.keyDigest === createHash('sha256').update(settings.key).digest('hex')
     ? modelCache.ids
     : [];
+  if (!validateModel(settings.provider, settings.model) && !allowedModels.includes(settings.model)) {
+    const models = await listProviderModels(settings.provider, settings.key);
+    allowedModels = models.map((model) => model.id);
+    if (session) {
+      session.availableModels[settings.provider] = {
+        ids: allowedModels,
+        keyDigest: createHash('sha256').update(settings.key).digest('hex'),
+      };
+    }
+    if (!allowedModels.includes(settings.model)) {
+      throw new AiProviderError('The selected model is no longer available to this provider key. Refresh the model list in Settings and choose another model.', 400, 'unsupported_model');
+    }
+  }
   return generateText({
     provider: settings.provider,
     apiKey: settings.key,
@@ -239,16 +361,17 @@ app.get('/api/settings/models', async (req: Request, res: Response) => {
 });
 
 app.post('/api/settings/models', async (req: Request, res: Response) => {
-  const { provider } = req.body || {};
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const { provider } = body;
   if (!isAiProvider(provider)) {
     return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
   }
-  if (req.body.apiKey !== undefined && (typeof req.body.apiKey !== 'string' || req.body.apiKey.length > 1024)) {
+  if (body.apiKey !== undefined && (typeof body.apiKey !== 'string' || body.apiKey.length > 1024)) {
     return res.status(400).json({ success: false, error: 'The API key value is not valid.' });
   }
   const current = getAiSettings(req);
-  const key = typeof req.body.apiKey === 'string' && req.body.apiKey.trim()
-    ? req.body.apiKey.trim()
+  const key = typeof body.apiKey === 'string' && body.apiKey.trim()
+    ? body.apiKey.trim()
     : current.provider === provider ? current.key : '';
   try {
     const models = await loadProviderModels(req, provider, key);
@@ -259,10 +382,10 @@ app.post('/api/settings/models', async (req: Request, res: Response) => {
 });
 
 app.post('/api/settings', (req: Request, res: Response) => {
-  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const sessionId = requestSessionId(req);
   const session = sessionId ? sessions.get(sessionId) : undefined;
   const { provider, model, thinkingLevel, apiKey } = req.body || {};
-  if (!session || !isAiProvider(provider) ||
+  if (!sessionId || !session || !isAiProvider(provider) ||
     !['low', 'medium', 'high'].includes(thinkingLevel)) {
     return res.status(400).json({ success: false, error: 'Choose a supported provider, model, and thinking level.' });
   }
@@ -280,22 +403,50 @@ app.post('/api/settings', (req: Request, res: Response) => {
   if (!validateModel(selectedProvider, model) && !dynamicModelIsValid) {
     return res.status(400).json({ success: false, error: 'Refresh the provider model list and choose a model available to this key.' });
   }
-  session.provider = provider;
+  const previous = {
+    provider: session.provider,
+    model: session.model,
+    thinkingLevel: session.thinkingLevel,
+    keys: { ...session.keys },
+    persistedKeys: new Set(session.persistedKeys),
+  };
+  session.provider = selectedProvider;
   session.model = model;
   session.thinkingLevel = thinkingLevel;
   if (typeof apiKey === 'string' && apiKey.trim()) session.keys[selectedProvider] = apiKey.trim();
+  try {
+    persistSessionKeys(sessionId, session);
+  } catch {
+    session.provider = previous.provider;
+    session.model = previous.model;
+    session.thinkingLevel = previous.thinkingLevel;
+    session.keys = previous.keys;
+    session.persistedKeys = previous.persistedKeys;
+    console.error('[AI] Provider settings could not be written to the encrypted vault.');
+    return res.status(500).json({
+      success: false,
+      error: 'Could not save provider settings securely. Check the encrypted key-vault file permissions and available disk space.',
+    });
+  }
   return res.json({ success: true, data: getAiSettings(req).publicSettings });
 });
 
 app.post('/api/settings/test', async (req: Request, res: Response) => {
-  const { provider } = req.body || {};
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const { provider } = body;
   if (!isAiProvider(provider)) {
     return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
   }
+  if (body.apiKey !== undefined && (typeof body.apiKey !== 'string' || body.apiKey.length > 1024)) {
+    return res.status(400).json({ success: false, error: 'The API key value is not valid.' });
+  }
   const active = getAiSettings(req);
-  const key = typeof req.body.apiKey === 'string' && req.body.apiKey.trim()
-    ? req.body.apiKey.trim()
-    : active.provider === provider ? active.key : '';
+  const sessionId = requestSessionId(req);
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  const key = typeof body.apiKey === 'string' && body.apiKey.trim()
+    ? body.apiKey.trim()
+    : session?.keys[provider] || getEnvironmentKey(provider) ||
+      (active.provider === provider ? active.key : '');
   if (!key) return res.status(400).json({ success: false, error: `Enter a ${provider} API key to test.` });
   try {
     await testProviderKey(provider, key);
@@ -310,9 +461,25 @@ app.post('/api/settings/key/remove', (req: Request, res: Response) => {
   if (!isAiProvider(provider)) {
     return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
   }
-  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
+  const sessionId = requestSessionId(req);
   const session = sessionId ? sessions.get(sessionId) : undefined;
-  if (session) delete session.keys[provider as AiProvider];
+  if (session && sessionId) {
+    const previousKey = session.keys[provider];
+    const wasPersisted = session.persistedKeys.has(provider);
+    delete session.keys[provider];
+    session.persistedKeys.delete(provider);
+    try {
+      persistSessionKeys(sessionId, session);
+    } catch {
+      if (previousKey) session.keys[provider] = previousKey;
+      if (wasPersisted) session.persistedKeys.add(provider);
+      console.error('[AI] Provider credentials could not be removed from the encrypted vault.');
+      return res.status(500).json({
+        success: false,
+        error: 'Could not remove the provider key securely. Check the encrypted key-vault file permissions and available disk space.',
+      });
+    }
+  }
   return res.json({ success: true, data: getAiSettings(req).publicSettings });
 });
 
@@ -332,8 +499,15 @@ app.post('/api/ai/script', async (req: Request, res: Response) => {
       visualStyle,
     } = req.body;
 
-    if (!idea) {
-      return res.status(400).json({ success: false, error: 'Project idea is required.' });
+    if (!isNonEmptyText(idea, 20_000)) {
+      return res.status(typeof idea === 'string' && idea.length > 20_000 ? 413 : 400)
+        .json({ success: false, error: 'Project idea must contain text and be 20,000 characters or fewer.' });
+    }
+    if (![title, tone, targetAudience, language, visualStyle].every((value) => isOptionalText(value, 2_000)) ||
+        (contentType !== undefined && typeof contentType !== 'string') ||
+        (durationMinutes !== undefined &&
+          (typeof durationMinutes !== 'number' || !Number.isFinite(durationMinutes) || durationMinutes < 1 || durationMinutes > 60))) {
+      return res.status(400).json({ success: false, error: 'One or more project generation settings are invalid.' });
     }
 
     const systemInstruction = `You are an elite screenwriter and creative director specializing in high-impact narrative and commercial content.
@@ -381,6 +555,14 @@ Format requirements:
 app.post('/api/ai/regenerate-section', async (req: Request, res: Response) => {
   try {
     const { sectionType, currentScript, projectIdea, instructions } = req.body;
+    const sectionTypes = ['title', 'logline', 'synopsis', 'fullScript'];
+    if (!sectionTypes.includes(sectionType) || !currentScript ||
+        !isNonEmptyText(projectIdea, 20_000) ||
+        !isOptionalText(instructions, 4_000) ||
+        !['title', 'logline', 'synopsis', 'fullScript'].every((field) =>
+          typeof currentScript[field] === 'string')) {
+      return res.status(400).json({ success: false, error: 'Provide a valid screenplay section, current script, project idea, and instructions.' });
+    }
 
     const prompt = `You are a script doctor and screenwriter.
 Rewrite ONLY the ${sectionType} for the following project:
@@ -413,6 +595,10 @@ Return ONLY the updated content for ${sectionType}. Do not destroy or include th
 app.post('/api/ai/bible', async (req: Request, res: Response) => {
   try {
     const { script, title, contentType } = req.body;
+    if (!isNonEmptyText(script, 100_000) || !isOptionalText(title, 2_000) ||
+        (contentType !== undefined && typeof contentType !== 'string')) {
+      return res.status(400).json({ success: false, error: 'A screenplay of 100,000 characters or fewer is required.' });
+    }
 
     const responseSchema = {
       type: Type.OBJECT,
@@ -513,6 +699,15 @@ Analyze the script and extract:
 app.post('/api/ai/scenes', async (req: Request, res: Response) => {
   try {
     const { script, title, contentType, durationMinutes, bible } = req.body;
+    if (!isNonEmptyText(script, 100_000) || !isOptionalText(title, 2_000) ||
+        (contentType !== undefined && typeof contentType !== 'string') ||
+        (durationMinutes !== undefined &&
+          (typeof durationMinutes !== 'number' || !Number.isFinite(durationMinutes) || durationMinutes < 1 || durationMinutes > 60)) ||
+        (bible !== undefined && (!bible || typeof bible !== 'object' ||
+          (bible.characters !== undefined && !Array.isArray(bible.characters)) ||
+          (bible.locations !== undefined && !Array.isArray(bible.locations))))) {
+      return res.status(400).json({ success: false, error: 'Provide a valid screenplay, duration, and optional world bible.' });
+    }
 
     const bibleContext = bible
       ? `Visual Theme: ${bible.visualTheme || ''}
@@ -595,6 +790,12 @@ For each scene, formulate:
 app.post('/api/ai/visual-prompts', async (req: Request, res: Response) => {
   try {
     const { scene, bible, visualStyle } = req.body;
+    if (!scene || typeof scene !== 'object' || Array.isArray(scene) ||
+        !isOptionalText(visualStyle, 2_000) ||
+        ![scene.title, scene.description, scene.actions, scene.cameraDirection, scene.setting, scene.timeOfDay, scene.mood]
+          .every((value) => isOptionalText(value, 2_000))) {
+      return res.status(400).json({ success: false, error: 'Provide a valid scene and visual style.' });
+    }
 
     const prompt = `Synthesize an ultra-detailed, cinematic text prompt for generating a storyboard image:
 Scene Title: ${scene.title}
@@ -641,13 +842,42 @@ app.post('/api/ai/generate-image', async (req: Request, res: Response) => {
     if (!['16:9', '9:16', '1:1', '4:3'].includes(aspectRatio)) {
       return res.status(400).json({ success: false, error: 'Choose a supported image aspect ratio.' });
     }
+    const settings = getAiSettings(req);
+    if (!PROVIDER_CAPABILITIES[settings.provider].image) {
+      return res.status(400).json({
+        success: false,
+        error: `Image generation is not supported by ${settings.provider}. Select Gemini or OpenAI in Settings; SceneCraft will not switch providers automatically.`,
+      });
+    }
+    if (!settings.key) {
+      throw new AiProviderError(`Add a ${settings.provider} API key in Settings to generate images.`, 503, 'missing_key');
+    }
+    const referenceImages = validateReferenceImages(req.body.referenceImages);
 
-    // Image generation remains tied to Gemini; the text model selector does not affect it.
+    if (settings.provider === 'openai') {
+      consumeGenerationBudget(req);
+      return res.json({
+        success: true,
+        data: await generateOpenAiImage({
+          apiKey: settings.key,
+          prompt,
+          aspectRatio,
+          referenceImages,
+        }),
+      });
+    }
+
     const ai = await getGeminiClient(req);
+    const promptParts = [
+      { text: prompt },
+      ...referenceImages.map((image) => ({
+        inlineData: { mimeType: image.mimeType, data: image.data },
+      })),
+    ];
     const response = await ai.models.generateContent({
       model: GEMINI_IMAGE_MODEL,
       contents: {
-        parts: [{ text: prompt }],
+        parts: promptParts,
       },
       config: {
         responseModalities: ['IMAGE'],
@@ -659,8 +889,8 @@ app.post('/api/ai/generate-image', async (req: Request, res: Response) => {
 
     let imageUrl: string | null = null;
     let imageMimeType = 'image/png';
-    const parts = response.candidates?.[0]?.content?.parts || [];
-    for (const part of parts) {
+    const responseParts = response.candidates?.[0]?.content?.parts || [];
+    for (const part of responseParts) {
       if (part.inlineData && part.inlineData.data) {
         imageMimeType = part.inlineData.mimeType || imageMimeType;
         imageUrl = `data:${imageMimeType};base64,${part.inlineData.data}`;
@@ -692,13 +922,44 @@ app.post('/api/ai/generate-image', async (req: Request, res: Response) => {
 // ==========================================
 app.post('/api/ai/audio-tts', async (req: Request, res: Response) => {
   try {
-    const { text, voice = 'Kore', speakerRole } = req.body;
+    const { text, speakerRole } = req.body;
+    const settings = getAiSettings(req);
+    const voice = req.body?.voice || (settings.provider === 'openai' ? 'alloy' : 'Kore');
+    const voices = settings.provider === 'openai'
+      ? ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'onyx', 'nova', 'sage', 'shimmer', 'verse', 'marin', 'cedar']
+      : ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
 
     if (typeof text !== 'string' || text.trim().length === 0) {
       return res.status(400).json({ success: false, error: 'Text is required for TTS synthesis.' });
     }
     if (text.length > 1000) {
       return res.status(413).json({ success: false, error: 'Audio text must be 1,000 characters or fewer.' });
+    }
+    if (!PROVIDER_CAPABILITIES[settings.provider].speech) {
+      return res.status(400).json({
+        success: false,
+        error: `Speech generation is not supported by ${settings.provider}. Select Gemini or OpenAI in Settings; SceneCraft will not switch providers automatically.`,
+      });
+    }
+    if (typeof voice !== 'string' || !voices.includes(voice)) {
+      return res.status(400).json({ success: false, error: `Choose a supported ${settings.provider} speech voice.` });
+    }
+    if (speakerRole !== undefined && (typeof speakerRole !== 'string' || speakerRole.length > 100)) {
+      return res.status(400).json({ success: false, error: 'Speaker role must be 100 characters or fewer.' });
+    }
+
+    if (settings.provider === 'openai') {
+      if (!settings.key) throw new AiProviderError('Add an OpenAI API key in Settings to generate speech.', 503, 'missing_key');
+      consumeGenerationBudget(req);
+      return res.json({
+        success: true,
+        data: await generateOpenAiSpeech({
+          apiKey: settings.key,
+          text,
+          voice,
+          ...(speakerRole ? { speakerRole } : {}),
+        }),
+      });
     }
 
     const ai = await getGeminiClient(req);
@@ -721,28 +982,42 @@ app.post('/api/ai/audio-tts', async (req: Request, res: Response) => {
         responseModalities: ['AUDIO'],
         speechConfig: {
           voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voice as any },
+            prebuiltVoiceConfig: { voiceName: voice },
           },
         },
       },
     });
 
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64Audio) {
+    const audioPart = response.candidates?.[0]?.content?.parts?.find((part) => part.inlineData?.data)?.inlineData;
+    if (!audioPart?.data) {
       return res.status(500).json({
         success: false,
         error: 'No audio data returned from Gemini TTS model.',
       });
     }
 
-    // Default unary return is a complete WAV file with 44-byte RIFF header
-    const audioUrl = `data:audio/wav;base64,${base64Audio}`;
+    const mimeType = audioPart.mimeType || 'audio/L16;rate=24000';
+    const bytes = Buffer.from(audioPart.data, 'base64');
+    let wavBytes = bytes;
+    let sampleRate = Number(mimeType.match(/rate=(\d+)/i)?.[1] || 24000);
+    if (bytes.subarray(0, 4).toString('ascii') !== 'RIFF') {
+      if (!/pcm|l16/i.test(mimeType)) {
+        throw new AiProviderError('Gemini returned an unsupported audio encoding.', 502, 'unsupported_audio_format');
+      }
+      wavBytes = Buffer.from(pcm16ToWav(bytes, sampleRate));
+    } else {
+      sampleRate = bytes.readUInt32LE(24) || sampleRate;
+    }
+    const audioUrl = `data:audio/wav;base64,${wavBytes.toString('base64')}`;
+    const channels = wavBytes.readUInt16LE(22) || 1;
+    const bitsPerSample = wavBytes.readUInt16LE(34) || 16;
+    const dataSize = wavBytes.readUInt32LE(40);
 
     return res.json({
       success: true,
       data: {
         audioUrl,
-        duration: Math.max(2, Math.round(text.split(' ').length / 2.5)),
+        duration: Math.max(1, Math.round(dataSize / (sampleRate * channels * bitsPerSample / 8))),
       },
     });
   } catch (error) {
