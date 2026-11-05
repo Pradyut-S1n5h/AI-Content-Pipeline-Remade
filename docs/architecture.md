@@ -1,78 +1,39 @@
-# SceneCraft Architecture Documentation
+# Architecture
 
-## Overview
+## Local inference boundary
 
-SceneCraft is built as a full-stack, modular TypeScript application designed to guide digital creators from an initial idea through a structured content creation pipeline to finished media deliverables.
-
-```
-+-----------------------------------------------------------------------+
-|                           User Workspace                              |
-|   +---------------------------------------------------------------+   |
-|   |                     React 19 Frontend                         |   |
-|   |  - Pipeline Stage Controller                                  |   |
-|   |  - Screenplay & Section Editor                                |   |
-|   |  - World Bible Manager                                        |   |
-|   |  - Scene Engine (Reordering & Timing)                         |   |
-|   |  - Storyboard Grid & Lightbox                                 |   |
-|   |  - Interactive Animatic Player (Ken Burns)                    |   |
-|   |  - HTML5 Canvas & MediaRecorder Video Compiler                |   |
-|   |  - Export Suite (Fountain, CSV, PDF, JSON)                    |   |
-|   +-------------------------------+-------------------------------+   |
-|                                   |                                   |
-|                          HTTP / JSON APIs                             |
-|                                   v                                   |
-|   +-------------------------------+-------------------------------+   |
-|   |                    Express Backend (server.ts)                |   |
-|   |  - Static & Vite Dev Middleware                               |   |
-|   |  - Input Validation & Schema Enforcement                      |   |
-|   |  - Session-scoped Gemini/OpenAI/Anthropic/HF text adapters    |   |
-|   |  - Gemini/OpenAI image/audio adapters                         |   |
-|   |  - Health, settings, and key-verification endpoints            |   |
-|   +-------------------------------+-------------------------------+   |
-+-----------------------------------|-----------------------------------+
-                                    |
-               Gemini REST API / OpenAI Chat Completions / Gemini SDK
-                            v
-            +-----------------------------------------------------------------------+
-            | Text models: Gemini, OpenAI, Anthropic Claude, Hugging Face Qwen     |
-            | Gemini media: 2.5 Flash Image and 2.5 Flash Preview TTS              |
-            +-----------------------------------------------------------------------+
+```text
+React app ──same-origin──> Express (server.ts)
+                            ├── http://127.0.0.1:11434 ──> Ollama ──> Qwen 2.5 1.5B
+                            └── http://127.0.0.1:8765 ──> Python/Diffusers worker
+                                                            ├── Stable Diffusion 1.5
+                                                            └── CogVideoX 2B
 ```
 
----
+The Ollama and media-worker addresses are fixed loopback addresses, not user-configurable provider URLs. Text, image, and video inference requests do not leave the machine. Internet access is used only for ordinary app dependencies and downloading model weights from the configured repositories. No API credentials, provider adapters, cloud generation routes, or model-provider selectors remain.
 
-## Client-Server Separation & Security
+[`local-models.json`](../local-models.json) is the authoritative list of the three defaults, their repositories, estimated storage, licenses, and supported tasks. The app lazily loads one image/video pipeline at a time, serializes media inference, checks hardware before loading, and writes completed output to `.local-ai/outputs/`. Model files and the Python virtual environment are git-ignored.
 
-### Why Server-Side AI?
-1. **API Key Security**: Environment keys are read server-side. Web-entered keys are associated with an opaque `HttpOnly`, `SameSite=Strict` cookie; when configured, an AES-256-GCM vault encrypts keys at rest using an independently managed 32-byte `SCENECRAFT_KEY_ENCRYPTION_KEY`. API responses expose key status only. Production cookies use `Secure`.
-2. **Schema Enforcement**: Structured JSON responses are validated server-side before returning to the React client.
-3. **Bounded Requests**: Session limits cap generation frequency, prompts, and output tokens. Retries are limited to transient failures; invalid credentials and quota/rate-limit errors are not retried.
+## Model runtimes
 
----
+- **Writing:** fixed Ollama model `qwen2.5:1.5b`. Ollama's local pull endpoint downloads the model once; requests use the local chat endpoint. Existing screenplay, world bible, scene, visual-prompt, and direct writing workflows share this runtime.
+- **Image:** local Diffusers `StableDiffusionPipeline`, loaded from the downloaded model directory with local-files-only inference. Generated PNG dimensions are bounded and checked before inference.
+- **Video:** local Diffusers `CogVideoXPipeline`, with callback-based step progress, cooperative cancellation, MP4 encoding through `imageio-ffmpeg`, and a 2–6 second duration cap.
 
-## State Management & Local Persistence
+The Express process starts the standard-library Python worker on loopback. `npm run setup:local-ai` creates a Python 3.11 virtual environment and installs PyTorch plus the Diffusers stack. The worker starts without those packages too, so status/setup errors remain visible; media is not reported as ready until dependencies, weights, and resource checks all pass.
 
-SceneCraft follows a resilient local-first architecture:
-- **Primary Storage**: IndexedDB stores versioned project records and large media assets. Existing localStorage project records are migrated to IndexedDB; localStorage remains for the active-project pointer and a compatibility fallback.
-- **Autosave Engine**: `App.tsx` debounces autosave by 600ms; the header reports unsaved, saving, saved, or failed states and offers manual save.
-- **Portability**: Project backup JSON is versioned, validated, and retains legacy import support. It includes storyboard/audio data and the persisted rendered video; import stores the video as an IndexedDB Blob.
-- **Offline / Demo Resilience**: If no Gemini API key is configured on the host server, the application enters a clean, fully operational **Demo Mode** loaded with the complete *The Last Signal* short film project.
-- **AI Settings**: Provider/model preferences remain server-side and projects never contain keys or AI settings. Web-entered keys survive restarts only when the independent encryption secret and persistent vault storage are configured.
-- **Media Provider**: Gemini and OpenAI support image and speech. Anthropic and Hugging Face are explicitly text-only; unsupported operations are disabled and return a clear API error.
+## Frontend and storage
 
----
+Projects continue to use IndexedDB. Browser-built animatic video remains a separate feature from actual text-to-video inference. The new Local Generation stage provides prompt, status, preview, copy/download, and media cancellation controls. Existing project audio playback is preserved, but cloud TTS was removed rather than silently substituted.
 
-## Video Assembly Architecture
+## Resource protection
 
-Rather than relying on third-party cloud video rendering services that require paid subscriptions or mock buttons, SceneCraft implements a **genuine browser-side video assembler**:
+- Image/video downloads display estimated progress and are rejected when free disk is below the model size plus a buffer.
+- Runtime checks reject CPU image generation below 12 GB total / 8 GB available RAM, GPU image generation below 8 GB VRAM, and video generation below the configured 16 GB CUDA VRAM / 32 GB RAM target.
+- Text inference requires at least 4 GB total RAM and 1.5 GB available RAM.
+- Prompt length, output dimensions, video duration, and parallel generation are bounded.
+- Media models are not loaded simultaneously; the previous pipeline is released and CUDA cache is cleared before a model switch.
 
-1. **Asset Preparation**: Preloads all scene image assets into `HTMLImageElement` buffers.
-2. **Canvas Pipeline**: Allocates an off-screen `HTMLCanvasElement` at 30 FPS using the project's selected aspect ratio.
-3. **Cinematic Processing**:
-   - Calculates duration-adjusted frame counts per scene and paces frames at the recording rate.
-   - Applies continuous Ken Burns scale (1.0 to 1.08) and subtle panning.
-   - Overlays cinematic vignetting and lower-third typography (Scene Number, Title, Camera Framing).
-4. **Audio**: Decodes generated per-scene WAV assets and schedules them on a Web Audio stream alongside the canvas.
-5. **Encoding**: Captures stream via `canvas.captureStream(30)` and selects MP4 only when `MediaRecorder.isTypeSupported` confirms it; otherwise chooses a supported WebM codec.
-6. **Progressive Feedback**: Emits progress, supports abort, rejects unavailable or failed assets rather than drawing a fake placeholder, and stops media tracks/audio contexts when complete.
-7. **Output**: Checks for a non-empty supported media Blob, persists it in IndexedDB, previews it through a temporary object URL, and includes it in project backups. The object URL is recreated on restore.
+## Environment noted during implementation
+
+This Codespace is Ubuntu 24.04 with 2 vCPUs, Python 3.14.2, Node.js 24.21.0, 7.8 GiB RAM, no NVIDIA GPU, and about 18 GiB free disk. It cannot run the image or video defaults under these resource checks. Python 3.11 and Ollama are also absent, so successful local text inference has not been verified here. See [README](../README.md) for a supported-machine install path and the exact observed limits.

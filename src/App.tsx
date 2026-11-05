@@ -20,9 +20,8 @@ import {
   saveProjectVideo,
   deleteProjectVideo,
 } from './services/storage';
-import { checkServerHealth } from './services/api';
+import { getLocalStatus } from './services/api';
 import { DEMO_PROJECT_SIGNAL } from './utils/sampleData';
-import { AiProvider } from './services/aiProviders';
 import { appendScriptVersion, restoreScriptVersion } from './utils/scriptHistory';
 
 import { Header } from './components/Header';
@@ -37,6 +36,7 @@ import { StoryboardStage } from './components/stages/StoryboardStage';
 import { AudioStage } from './components/stages/AudioStage';
 import { VideoStage } from './components/stages/VideoStage';
 import { ExportStage } from './components/stages/ExportStage';
+import { GenerateStage } from './components/stages/GenerateStage';
 
 export default function App() {
   const [project, setProject] = useState<Project>(DEMO_PROJECT_SIGNAL);
@@ -47,9 +47,8 @@ export default function App() {
   const [projectRecoveryFailed, setProjectRecoveryFailed] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'saving' | 'saved' | 'unsaved' | 'failed'>('saved');
   const [saveError, setSaveError] = useState('');
-  const [hasGeminiKey, setHasGeminiKey] = useState(false);
-  const [hasAiKey, setHasAiKey] = useState(false);
-  const [activeProvider, setActiveProvider] = useState<AiProvider>('gemini');
+  const [modelsReady, setModelsReady] = useState(0);
+  const [modelStatusRefresh, setModelStatusRefresh] = useState(0);
 
   // Modals
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
@@ -81,11 +80,13 @@ export default function App() {
     };
     void restoreProjects();
 
-    checkServerHealth().then((res) => {
-      setHasGeminiKey(res.hasGeminiKey);
-      setHasAiKey(Boolean(res.hasAiKey));
-      if (res.provider) setActiveProvider(res.provider);
-    });
+    const refreshModels = async () => {
+      const local = await getLocalStatus();
+      if (local.success && local.data) {
+        setModelsReady(Object.values(local.data.models).filter((model) => model.ready).length);
+      }
+    };
+    void refreshModels();
     return () => { cancelled = true; };
   }, []);
 
@@ -374,7 +375,7 @@ export default function App() {
         saveStatus={saveStatus}
         saveError={saveError}
         onSaveNow={handleSaveNow}
-        hasAiKey={hasAiKey}
+        modelsReady={modelsReady}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
       />
 
@@ -396,6 +397,12 @@ export default function App() {
 
       {/* Main Workspace Stage Viewport */}
       <main className="flex-1 pb-16">
+        {currentStage === 'generate' && (
+          <GenerateStage
+            onOpenSetup={() => setIsSettingsModalOpen(true)}
+            statusRefresh={modelStatusRefresh}
+          />
+        )}
         {currentStage === 'project' && (
           <ProjectOverview
             project={project}
@@ -451,21 +458,16 @@ export default function App() {
               markStageCompleted('storyboard');
               navigateToStage('audio');
             }}
-            hasGeminiKey={hasGeminiKey}
-            activeProvider={activeProvider}
           />
         )}
 
         {currentStage === 'audio' && (
           <AudioStage
             project={project}
-            onUpdateScenes={(update) => handleUpdateScenes(project.metadata.id, update)}
             onProceedToVideo={() => {
               markStageCompleted('audio');
               navigateToStage('video');
             }}
-            hasGeminiKey={hasGeminiKey}
-            activeProvider={activeProvider}
           />
         )}
 
@@ -517,10 +519,11 @@ export default function App() {
         isOpen={isSettingsModalOpen}
         onClose={() => setIsSettingsModalOpen(false)}
         onSaved={() => {
-          checkServerHealth().then((res) => {
-            setHasGeminiKey(res.hasGeminiKey);
-            setHasAiKey(Boolean(res.hasAiKey));
-            if (res.provider) setActiveProvider(res.provider);
+          setModelStatusRefresh((version) => version + 1);
+          void getLocalStatus().then((local) => {
+            if (local.success && local.data) {
+              setModelsReady(Object.values(local.data.models).filter((model) => model.ready).length);
+            }
           });
         }}
       />

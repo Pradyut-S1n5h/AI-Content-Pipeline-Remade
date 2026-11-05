@@ -15,6 +15,7 @@ interface StageDefinition {
 }
 
 const STAGES: StageDefinition[] = [
+  { id: 'generate', number: '00', label: 'Local Generation' },
   { id: 'project', number: '01', label: 'Project Config' },
   { id: 'script', number: '02', label: 'Screenplay' },
   { id: 'bible', number: '03', label: 'World Bible' },

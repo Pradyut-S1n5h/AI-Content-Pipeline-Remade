@@ -22,6 +22,7 @@ const CONTENT_TYPES: ContentType[] = [
   'social_media_video',
 ];
 const PIPELINE_STAGES: PipelineStage[] = [
+  'generate',
   'project',
   'script',
   'bible',

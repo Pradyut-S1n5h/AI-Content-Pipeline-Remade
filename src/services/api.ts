@@ -1,11 +1,3 @@
-/**
- * SceneCraft Client API Service
- * 
- * Communicates with the server-side Express API for all AI reasoning,
- * structured generation, image generation, and audio TTS.
- * API keys never touch the client browser bundle.
- */
-
 import {
   ScriptGenerationRequest,
   SectionRegenerationRequest,
@@ -13,54 +5,72 @@ import {
   SceneBreakdownRequest,
   VisualPromptGenerationRequest,
   ImageGenerationRequest,
-  AudioTTSRequest,
   ScriptSection,
   WorldBible,
   Scene,
   ApiResponse,
 } from '../types';
-import {
-  AiProvider,
-  ModelOption,
-  PROVIDER_CAPABILITIES,
-  PROVIDER_MODELS,
-  ThinkingLevel,
-} from './aiProviders';
 
-export interface AiSettings {
-  provider: AiProvider;
+export type ModelKind = 'writing' | 'image' | 'video';
+
+export interface LocalModel {
+  label: string;
+  runtime: string;
   model: string;
-  thinkingLevel: ThinkingLevel;
-  hasSavedKey: boolean;
-  keySource: 'session' | 'persistent' | 'environment' | 'none';
-  keySources: Record<AiProvider, 'session' | 'persistent' | 'environment' | 'none'>;
-  maskedKey: string | null;
-  keyPersistenceAvailable: boolean;
-  capabilities: typeof PROVIDER_CAPABILITIES[AiProvider];
-  models: typeof PROVIDER_MODELS;
+  storage: string;
+  storageBytes: number;
+  license: string;
+  repository: string;
+  minimum: string;
+  tasks: string[];
+  installed: boolean;
+  ready: boolean;
+  runtimeRunning: boolean;
+  resourceError?: string;
+}
+
+export interface LocalStatus {
+  hardware: {
+    os: string;
+    python: string;
+    cpuCores: number;
+    ramMb: number;
+    availableRamMb: number;
+    gpu: string | null;
+    vramMb: number;
+    cuda: boolean;
+    diskFreeMb: number;
+  };
+  models: Record<ModelKind, LocalModel>;
+}
+
+export interface LocalJob {
+  id: string;
+  kind: ModelKind | 'image' | 'video';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  progress: number;
+  message: string;
+  error?: string;
+  output?: string;
+  mimeType?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-async function decodeApiResponse<T>(response: Response): Promise<ApiResponse<T>> {
+async function decode<T>(response: Response): Promise<ApiResponse<T>> {
   let payload: unknown;
   try {
     payload = await response.json();
   } catch {
-    return { success: false, error: 'The server returned an invalid response. Try again.' };
+    return { success: false, error: 'The server returned an invalid response.' };
   }
   if (!isRecord(payload) || typeof payload.success !== 'boolean') {
-    return { success: false, error: 'The server returned an unexpected response. Try again.' };
+    return { success: false, error: 'The server returned an unexpected response.' };
   }
   if (!response.ok || !payload.success) {
-    return {
-      success: false,
-      error: typeof payload.error === 'string'
-        ? payload.error
-        : typeof payload.message === 'string' ? payload.message : `Server error (${response.status})`,
-    };
+    return { success: false, error: typeof payload.error === 'string' ? payload.error : `Server error (${response.status})` };
   }
   return {
     success: true,
@@ -69,139 +79,122 @@ async function decodeApiResponse<T>(response: Response): Promise<ApiResponse<T>>
   };
 }
 
-async function postJson<T>(endpoint: string, body: unknown): Promise<ApiResponse<T>> {
+async function postJson<T>(url: string, body: unknown): Promise<ApiResponse<T>> {
   try {
-    const res = await fetch(endpoint, {
+    return await decode<T>(await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
-    return await decodeApiResponse<T>(res);
-  } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : 'Network request failed. Is the server running?',
-    };
+    }));
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Network request failed.' };
   }
 }
 
-export async function checkServerHealth(): Promise<{
-  status: string;
-  hasGeminiKey: boolean;
-  hasAiKey?: boolean;
-  provider?: AiProvider;
-}> {
+export async function checkServerHealth(): Promise<{ status: string; localInference: boolean; modelsReady: number }> {
   try {
-    const res = await fetch('/api/health');
-    if (res.ok) {
-      const payload: unknown = await res.json();
-      if (isRecord(payload) && typeof payload.status === 'string' &&
-          typeof payload.hasGeminiKey === 'boolean') {
-        return {
-          status: payload.status,
-          hasGeminiKey: payload.hasGeminiKey,
-          ...(payload.provider === 'gemini' || payload.provider === 'openai' ||
-              payload.provider === 'anthropic' || payload.provider === 'huggingface'
-            ? { provider: payload.provider }
-            : {}),
-          ...(typeof payload.hasAiKey === 'boolean' ? { hasAiKey: payload.hasAiKey } : {}),
-        };
-      }
+    const response = await fetch('/api/health');
+    const value: unknown = await response.json();
+    if (response.ok && isRecord(value)) {
+      return {
+        status: typeof value.status === 'string' ? value.status : 'offline',
+        localInference: value.localInference === true,
+        modelsReady: typeof value.modelsReady === 'number' ? value.modelsReady : 0,
+      };
     }
-    return { status: 'offline', hasGeminiKey: false };
   } catch {
-    return { status: 'offline', hasGeminiKey: false };
+    return { status: 'offline', localInference: true, modelsReady: 0 };
   }
+  return { status: 'offline', localInference: true, modelsReady: 0 };
 }
 
-export async function getAiSettings(): Promise<ApiResponse<AiSettings>> {
+export async function getLocalStatus(): Promise<ApiResponse<LocalStatus>> {
   try {
-    const response = await fetch('/api/settings');
-    return await decodeApiResponse<AiSettings>(response);
-  } catch {
-    return { success: false, error: 'Could not reach server settings.' };
+    return await decode<LocalStatus>(await fetch('/api/local/status'));
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Could not load local model status.' };
   }
 }
 
-export async function getProviderModels(provider: AiProvider, apiKey?: string): Promise<ApiResponse<ModelOption[]>> {
+export async function installLocalModel(kind: ModelKind): Promise<ApiResponse<{ id: string }>> {
   try {
-    if (apiKey) return postJson<ModelOption[]>('/api/settings/models', { provider, apiKey });
-    const response = await fetch(`/api/settings/models?provider=${provider}`);
-    return await decodeApiResponse<ModelOption[]>(response);
-  } catch {
-    return { success: false, error: 'Could not load provider models.' };
+    return await decode<{ id: string }>(await fetch(`/api/local/install/${kind}`, { method: 'POST' }));
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Could not start model installation.' };
   }
 }
 
-export async function saveAiSettings(settings: {
-  provider: AiProvider;
-  model: string;
-  thinkingLevel: ThinkingLevel;
-  apiKey?: string;
-}): Promise<ApiResponse<AiSettings>> {
-  return postJson<AiSettings>('/api/settings', settings);
+export async function getLocalJob(id: string): Promise<ApiResponse<LocalJob>> {
+  try {
+    return await decode<LocalJob>(await fetch(`/api/local/jobs/${encodeURIComponent(id)}`));
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Could not read generation status.' };
+  }
 }
 
-export async function testAiSettings(settings: {
-  provider: AiProvider;
-  apiKey?: string;
-}): Promise<ApiResponse<{ valid: boolean }>> {
-  return postJson<{ valid: boolean }>('/api/settings/test', settings);
+export async function cancelLocalJob(id: string): Promise<ApiResponse<void>> {
+  return postJson<void>(`/api/local/jobs/${encodeURIComponent(id)}/cancel`, {});
 }
 
-export async function removeAiKey(provider: AiProvider): Promise<ApiResponse<AiSettings>> {
-  return postJson<AiSettings>('/api/settings/key/remove', { provider });
+export async function generateWriting(prompt: string): Promise<ApiResponse<{ text: string; model: string }>> {
+  return postJson('/api/generate/writing', { prompt });
 }
 
-export async function generateScriptApi(
-  req: ScriptGenerationRequest
-): Promise<ApiResponse<ScriptSection>> {
-  return postJson<ScriptSection>('/api/ai/script', req);
+export async function generateMedia(
+  kind: 'image' | 'video',
+  prompt: string,
+  options: Record<string, number>,
+): Promise<ApiResponse<{ id: string }>> {
+  return postJson(`/api/local/generate/${kind}`, { prompt, options });
+}
+
+export async function generateScriptApi(req: ScriptGenerationRequest): Promise<ApiResponse<ScriptSection>> {
+  return postJson('/api/ai/script', req);
 }
 
 export async function regenerateScriptSectionApi(
-  req: SectionRegenerationRequest
+  req: SectionRegenerationRequest,
 ): Promise<ApiResponse<{ sectionType: string; content: string }>> {
-  return postJson<{ sectionType: string; content: string }>(
-    '/api/ai/regenerate-section',
-    req
-  );
+  return postJson('/api/ai/regenerate-section', req);
 }
 
-export async function extractWorldBibleApi(
-  req: BibleExtractionRequest
-): Promise<ApiResponse<WorldBible>> {
-  return postJson<WorldBible>('/api/ai/bible', req);
+export async function extractWorldBibleApi(req: BibleExtractionRequest): Promise<ApiResponse<WorldBible>> {
+  return postJson('/api/ai/bible', req);
 }
 
-export async function breakdownScenesApi(
-  req: SceneBreakdownRequest
-): Promise<ApiResponse<Scene[]>> {
-  return postJson<Scene[]>('/api/ai/scenes', req);
+export async function breakdownScenesApi(req: SceneBreakdownRequest): Promise<ApiResponse<Scene[]>> {
+  return postJson('/api/ai/scenes', req);
 }
 
 export async function generateVisualPromptApi(
-  req: VisualPromptGenerationRequest
+  req: VisualPromptGenerationRequest,
 ): Promise<ApiResponse<{ prompt: string }>> {
-  return postJson<{ prompt: string }>('/api/ai/visual-prompts', req);
+  return postJson('/api/ai/visual-prompts', req);
 }
 
 export async function generateImageApi(
-  req: ImageGenerationRequest
+  req: ImageGenerationRequest,
 ): Promise<ApiResponse<{ imageUrl: string; mimeType: string }>> {
-  return postJson<{ imageUrl: string; mimeType: string }>(
-    '/api/ai/generate-image',
-    req
-  );
-}
-
-export async function generateAudioTTSApi(
-  req: AudioTTSRequest
-): Promise<ApiResponse<{ audioUrl: string; duration: number }>> {
-  return postJson<{ audioUrl: string; duration: number }>(
-    '/api/ai/audio-tts',
-    req
-  );
+  const dimensions: Record<NonNullable<ImageGenerationRequest['aspectRatio']>, { width: number; height: number }> = {
+    '16:9': { width: 512, height: 288 },
+    '9:16': { width: 288, height: 512 },
+    '1:1': { width: 512, height: 512 },
+    '4:3': { width: 512, height: 384 },
+  };
+  const started = await generateMedia('image', req.prompt, dimensions[req.aspectRatio || '16:9']);
+  if (!started.success || !started.data) return { success: false, error: started.error || 'Could not start image generation.' };
+  const deadline = Date.now() + 45 * 60_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const status = await getLocalJob(started.data.id);
+    if (!status.success || !status.data) return { success: false, error: status.error || 'Could not read image generation status.' };
+    if (status.data.status === 'failed' || status.data.status === 'cancelled') {
+      return { success: false, error: status.data.error || status.data.message };
+    }
+    if (status.data.status === 'completed' && status.data.output) {
+      return { success: true, data: { imageUrl: status.data.output, mimeType: status.data.mimeType || 'image/png' } };
+    }
+  }
+  await cancelLocalJob(started.data.id);
+  return { success: false, error: 'Image generation exceeded the 45-minute limit and was cancelled.' };
 }

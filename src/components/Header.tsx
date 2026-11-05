@@ -11,7 +11,7 @@ interface HeaderProps {
   saveStatus: 'saving' | 'saved' | 'unsaved' | 'failed';
   saveError?: string;
   onSaveNow: () => void;
-  hasAiKey: boolean;
+  modelsReady: number;
   onOpenSettings: () => void;
 }
 
@@ -24,7 +24,7 @@ export const Header: React.FC<HeaderProps> = ({
   saveStatus,
   saveError,
   onSaveNow,
-  hasAiKey,
+  modelsReady,
   onOpenSettings,
 }) => {
   return (
@@ -111,25 +111,25 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="hidden sm:inline">Save</span>
         </button>
 
-        {/* API / Mode Indicator */}
+        {/* Local model readiness */}
         <div className="hidden lg:flex items-center gap-2 text-xs text-zinc-400 border border-zinc-800/80 px-2.5 py-1 rounded bg-zinc-900/60">
           <div
             className={`w-2 h-2 rounded-full ${
-              hasAiKey ? 'bg-emerald-400' : 'bg-amber-400'
+              modelsReady === 3 ? 'bg-emerald-400' : 'bg-amber-400'
             }`}
           />
-          <span>{hasAiKey ? 'AI provider ready' : 'Demo / key needed'}</span>
+          <span>{modelsReady}/3 local models ready</span>
         </div>
 
         <button
           type="button"
           onClick={onOpenSettings}
-          title="AI Settings"
-          aria-label="Open AI settings"
+          title="Local Model Setup"
+          aria-label="Open local model setup"
           className="inline-flex items-center gap-1.5 rounded border border-zinc-700 px-2.5 py-1.5 text-xs text-zinc-300 transition-colors hover:border-zinc-500 hover:bg-zinc-900 hover:text-zinc-100"
         >
           <Settings2 className="h-3.5 w-3.5" />
-          <span className="hidden sm:inline">AI Settings</span>
+          <span className="hidden sm:inline">Models</span>
         </button>
 
         {/* New Project Button */}

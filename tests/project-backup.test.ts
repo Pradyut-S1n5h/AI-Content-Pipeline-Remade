@@ -47,7 +47,7 @@ describe('Project backup and migration', () => {
     assert.equal(escapeHtml(`<script src="bad">&'`), '&lt;script src=&quot;bad&quot;&gt;&amp;&#39;');
   });
 
-  it('wraps provider PCM audio in a valid 16-bit WAV container', () => {
+  it('wraps PCM audio in a valid 16-bit WAV container', () => {
     const wav = Buffer.from(pcm16ToWav(new Uint8Array([0, 0, 255, 127]), 24000));
 
     assert.equal(wav.toString('ascii', 0, 4), 'RIFF');

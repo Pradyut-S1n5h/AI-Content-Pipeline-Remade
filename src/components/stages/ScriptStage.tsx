@@ -73,7 +73,7 @@ export const ScriptStage: React.FC<ScriptStageProps> = ({
       }), 'Generated full screenplay');
     } else {
       setErrorMessage(
-        res.error || 'Failed to generate script. Make sure your server has a valid GEMINI_API_KEY or explore the pre-loaded demo project.'
+        res.error || 'Local script generation failed. Check that the writing model is installed and the Ollama runtime is running.'
       );
     }
   };

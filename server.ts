@@ -1,1064 +1,525 @@
 /**
- * SceneCraft Full-Stack Express Server
- * 
- * Handles all AI interactions server-side using the official @google/genai SDK:
- * - Provider/model-selectable text generation (Gemini and OpenAI)
- * - Gemini image generation (gemini-2.5-flash-image)
- * - Gemini speech synthesis (gemini-2.5-flash-preview-tts)
- * - Vite dev middleware mounting for seamless development
+ * Express API and Vite host. All generation requests stay on this machine:
+ * text uses Ollama on loopback; image and video use the local Diffusers worker.
  */
 
-import express, { NextFunction, Request, Response } from 'express';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { createHash, randomUUID } from 'crypto';
+import express, { NextFunction, Request, Response as ExpressResponse } from 'express';
+import path from 'node:path';
+import os from 'node:os';
+import { spawn, ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
-import {
-  AiProvider,
-  AiProviderError,
-  GenerateTextOptions,
-  GEMINI_IMAGE_MODEL,
-  PROVIDER_MODELS,
-  PROVIDER_CAPABILITIES,
-  ThinkingLevel,
-  generateText,
-  listProviderModels,
-  safeProviderError,
-  testProviderKey,
-  validateJsonSchema,
-  validateModel,
-} from './src/services/aiProviders';
-import { pcm16ToWav } from './src/utils/wav';
-import { createKeyVault } from './src/services/keyVault';
-import { generateOpenAiImage, generateOpenAiSpeech } from './src/services/serverMediaProviders';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const keyVault = createKeyVault(
-  process.env.SCENECRAFT_KEY_ENCRYPTION_KEY,
-  process.env.SCENECRAFT_KEY_STORE_PATH || path.resolve(__dirname, '.scenecraft/keys.json')
-);
-
+const root = path.dirname(fileURLToPath(import.meta.url));
+const modelConfig = JSON.parse(readFileSync(path.join(root, 'local-models.json'), 'utf8')) as Record<string, {
+  label: string; runtime: string; model: string; storage: string; storageBytes: number; license: string;
+  repository: string; minimum: string; tasks: string[];
+  hardware: { minRamMb: number; minCpuRamMb?: number; minAvailableRamMb?: number; minVramMb?: number; cuda?: boolean };
+}>;
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const port = Number(process.env.PORT || 3000);
+const workerUrl = 'http://127.0.0.1:8765';
+const ollamaUrl = 'http://127.0.0.1:11434';
+const outputDir = path.join(root, '.local-ai', 'outputs');
+const workerPython = path.join(
+  root,
+  '.venv-ai',
+  process.platform === 'win32' ? 'Scripts' : 'bin',
+  process.platform === 'win32' ? 'python.exe' : 'python',
+);
+let workerProcess: ChildProcess | undefined;
 
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
-
-interface ServerSession {
-  provider?: AiProvider;
-  model?: string;
-  thinkingLevel?: ThinkingLevel;
-  keys: Partial<Record<AiProvider, string>>;
-  persistedKeys: Set<AiProvider>;
-  availableModels: Partial<Record<AiProvider, { ids: string[]; keyDigest: string }>>;
-  generationTimes: number[];
-  lastUsed: number;
-}
-const sessions = new Map<string, ServerSession>();
-let lastSessionCleanup = 0;
-
-function requestSessionId(req: Request): string | undefined {
-  const cookie = req.headers.cookie?.split(';')
-    .map((part) => part.trim())
-    .find((part) => part.startsWith('ai_session='));
-  const sessionId = cookie?.slice('ai_session='.length);
-  return sessionId && /^[\da-f-]{36}$/i.test(sessionId) ? sessionId : undefined;
+interface LocalJob {
+  id: string;
+  kind: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  progress: number;
+  message: string;
+  error?: string;
+  output?: string;
+  mimeType?: string;
 }
 
-app.use((req: Request, res: Response, next) => {
-  const now = Date.now();
-  if (now - lastSessionCleanup > 60_000 || sessions.size >= 500) {
-    for (const [id, value] of sessions) {
-      if (now - value.lastUsed > 86_400_000) sessions.delete(id);
-    }
-    lastSessionCleanup = now;
+const localJobs = new Map<string, LocalJob>();
+const activeGenerations = new Set<string>();
+let textGenerationActive = false;
+
+app.use(express.json({ limit: '2mb' }));
+app.use('/generated', express.static(outputDir, { fallthrough: false, maxAge: '1d' }));
+
+function sendError(res: ExpressResponse, error: unknown) {
+  const message = error instanceof Error ? error.message : 'Local generation failed.';
+  const status = /already active|already being installed|already running|cannot be cancelled/i.test(message) ? 409
+    : /not installed|not running|not meet|needs a CUDA|needs at least|not available/i.test(message)
+    ? 503
+    : /needs .*(RAM|VRAM|CUDA)|disabled on this hardware/i.test(message) ? 503
+    : /out of memory/i.test(message) ? 507 : 500;
+  return res.status(status).json({ success: false, error: message });
+}
+
+function validatePrompt(prompt: unknown, maximum = 4000): prompt is string {
+  return typeof prompt === 'string' && prompt.trim().length > 0 && prompt.length <= maximum;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+async function localFetch(url: string, init?: RequestInit): Promise<globalThis.Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(30_000) });
+  } catch {
+    throw new Error('The local inference runtime is not running. Follow the setup instructions in README.md; no remote provider will be used.');
   }
-  let sessionId = requestSessionId(req);
-  if (!sessionId || !sessions.has(sessionId)) {
+}
+
+async function getOllamaModels(): Promise<string[]> {
+  const response = await localFetch(`${ollamaUrl}/api/tags`);
+  if (!response.ok) throw new Error('Ollama did not return its local model list.');
+  const payload = await response.json() as { models?: Array<{ name?: string }> };
+  return (payload.models || []).flatMap((model) => model.name ? [model.name] : []);
+}
+
+function isOllamaModelInstalled(names: string[]) {
+  const expected = modelConfig.writing.model;
+  return names.some((name) => name === expected || name.startsWith(`${expected}:`) || name.startsWith(`${expected.split(':')[0]}:`) && name.includes(expected.split(':')[1]));
+}
+
+async function generateText(prompt: string, options: { system?: string; json?: boolean; tokens?: number } = {}) {
+  if (textGenerationActive) throw new Error('A writing generation is already active. Wait for it to finish.');
+  textGenerationActive = true;
+  try {
+    const requirements = modelConfig.writing.hardware;
+    if (os.totalmem() < requirements.minRamMb * 1_000_000 ||
+        os.freemem() < (requirements.minAvailableRamMb || 0) * 1_000_000) {
+      throw new Error(`The writing model needs ${modelConfig.writing.minimum}. Close other workloads or use a larger machine.`);
+    }
+    const names = await getOllamaModels();
+    if (!isOllamaModelInstalled(names)) {
+      throw new Error(`The default writing model (${modelConfig.writing.model}) is not installed. Open Model Setup and install it.`);
+    }
+    const response = await fetch(`${ollamaUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelConfig.writing.model,
+        stream: false,
+        ...(options.json ? { format: 'json' } : {}),
+        messages: [
+          ...(options.system ? [{ role: 'system', content: options.system }] : []),
+          { role: 'user', content: prompt },
+        ],
+        options: { num_predict: options.tokens || 2048, temperature: 0.7 },
+      }),
+      signal: AbortSignal.timeout(10 * 60_000),
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Local text generation failed (${response.status}): ${body.slice(0, 400) || 'Ollama returned an error.'}`);
+    }
+    const result = await response.json() as { message?: { content?: string }; error?: string };
+    if (result.error) throw new Error(`Local text generation failed: ${result.error}`);
+    if (typeof result.message?.content !== 'string' || !result.message.content.trim()) {
+      throw new Error('The local model returned an empty response.');
+    }
+    return result.message.content.trim();
+  } finally {
+    textGenerationActive = false;
+  }
+}
+
+async function generateJson<T>(prompt: string, system: string, required: string[]): Promise<T> {
+  const content = await generateText(prompt, { system, json: true, tokens: 4096 });
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new Error('The local model returned invalid JSON. Please retry with a shorter prompt.');
+  }
+  if (!value || typeof value !== 'object' || required.some((key) => !(key in value))) {
+    throw new Error('The local model response did not contain the required fields. Please retry.');
+  }
+  return value as T;
+}
+
+async function workerRequest(route: string, init?: RequestInit) {
+  try {
+    const response = await fetch(`${workerUrl}${route}`, {
+      ...init,
+      signal: AbortSignal.timeout(15_000),
+      headers: { 'Content-Type': 'application/json', ...init?.headers },
+    });
+    const result = await response.json() as Record<string, unknown>;
+    if (!response.ok) throw new Error(typeof result.error === 'string' ? result.error : 'The local media worker returned an error.');
+    return result;
+  } catch (error) {
+    if (error instanceof Error && error.message !== 'fetch failed' && !error.name.includes('Timeout')) throw error;
+    throw new Error('The local image/video worker is unavailable. Use Python 3.11 and run `npm run setup:local-ai`; no remote service will be used.');
+  }
+}
+
+async function getLocalStatus() {
+  const [ollama, worker] = await Promise.allSettled([
+    getOllamaModels(),
+    workerRequest('/status'),
+  ]);
+  const names = ollama.status === 'fulfilled' ? ollama.value : [];
+  const workerData = worker.status === 'fulfilled' ? worker.value as {
+    hardware?: Record<string, unknown>;
+    models?: Record<string, Record<string, unknown>>;
+  } : {};
+  const hardware = workerData.hardware || {
+    os: `${os.platform()} ${os.release()}`,
+    python: 'worker unavailable',
+    cpuCores: os.cpus().length,
+    ramMb: Math.floor(os.totalmem() / 1024 / 1024),
+    availableRamMb: 0,
+    gpu: null,
+    vramMb: 0,
+    cuda: false,
+    diskFreeMb: 0,
+  };
+  const workerModels = workerData.models || {};
+  const mediaRuntimeRunning = worker.status === 'fulfilled' && hardware.torchAvailable === true;
+  const writingInstalled = isOllamaModelInstalled(names);
+  const writingRuntimeRunning = ollama.status === 'fulfilled';
+  const writingResourceError = !writingRuntimeRunning ? 'Ollama is not running on this machine.'
+    : os.totalmem() < modelConfig.writing.hardware.minRamMb * 1_000_000 ||
+      os.freemem() < (modelConfig.writing.hardware.minAvailableRamMb || 0) * 1_000_000
+      ? `The writing model needs ${modelConfig.writing.minimum}.` : undefined;
+  return {
+    hardware,
+    models: {
+      writing: {
+        ...modelConfig.writing,
+        installed: writingInstalled,
+        ready: writingInstalled && writingRuntimeRunning && !writingResourceError,
+        runtimeRunning: writingRuntimeRunning,
+        resourceError: writingResourceError,
+      },
+      image: {
+        ...modelConfig.image,
+        ...(workerModels.image || {}),
+        installed: workerModels.image?.installed === true,
+        ready: workerModels.image?.ready === true,
+        runtimeRunning: mediaRuntimeRunning,
+      },
+      video: {
+        ...modelConfig.video,
+        ...(workerModels.video || {}),
+        installed: workerModels.video?.installed === true,
+        ready: workerModels.video?.ready === true,
+        runtimeRunning: mediaRuntimeRunning,
+      },
+    },
+  };
+}
+
+function startTextModelInstall(): string {
+  const existing = [...localJobs.values()].find((job) => job.kind === 'writing' && ['queued', 'running'].includes(job.status));
+  if (existing) throw new Error('The writing model is already being installed.');
+  const id = randomUUID();
+  const job: LocalJob = { id, kind: 'writing', status: 'queued', progress: 0, message: 'Connecting to local Ollama' };
+  localJobs.set(id, job);
+  void (async () => {
     try {
-      if (sessionId && keyVault.enabled) {
-        const restored = keyVault.load(sessionId);
-        if (restored) {
-          sessions.set(sessionId, {
-            ...restored.settings,
-            keys: restored.keys,
-            persistedKeys: new Set(Object.keys(restored.keys) as AiProvider[]),
-            availableModels: {},
-            generationTimes: [],
-            lastUsed: now,
-          });
+      const response = await fetch(`${ollamaUrl}/api/pull`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: modelConfig.writing.model, stream: true }),
+      });
+      if (!response.ok || !response.body) {
+        throw new Error('Ollama could not start the model download. Check that the local Ollama runtime is running.');
+      }
+      job.status = 'running';
+      job.message = 'Downloading writing model';
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const progress = JSON.parse(line) as { status?: string; completed?: number; total?: number; error?: string };
+          if (progress.error) throw new Error(progress.error);
+          job.message = progress.status || job.message;
+          if (progress.total) job.progress = Math.min(99, Math.floor((progress.completed || 0) * 100 / progress.total));
         }
       }
+      job.status = 'completed';
+      job.progress = 100;
+      job.message = 'Writing model installed';
     } catch (error) {
-      console.error('[AI] Provider settings could not be restored from the encrypted vault.');
-      return res.status(503).json({
-        success: false,
-        error: 'Saved provider credentials could not be restored. Check the server key-vault configuration and file permissions.',
-      });
+      job.status = 'failed';
+      job.message = 'Model installation failed';
+      job.error = error instanceof Error ? error.message : 'Could not install the local model.';
     }
-    if (!sessionId || !sessions.has(sessionId)) {
-      if (sessions.size >= 500) {
-        return res.status(503).json({ success: false, error: 'The server has reached its temporary browser-session limit. Try again later.' });
-      }
-      sessionId = randomUUID();
-      sessions.set(sessionId, { keys: {}, persistedKeys: new Set(), availableModels: {}, generationTimes: [], lastUsed: now });
-    }
-  }
-  const session = sessions.get(sessionId)!;
-  session.lastUsed = now;
-  res.setHeader('Set-Cookie', `ai_session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
-  next();
-});
-
-function getAiSettings(req: Request) {
-  const sessionId = requestSessionId(req);
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  const envProvider = isAiProvider(process.env.AI_PROVIDER) ? process.env.AI_PROVIDER : 'gemini';
-  const provider = session?.provider || envProvider;
-  const defaultModel = PROVIDER_MODELS[provider][0].id;
-  const envModel = process.env.AI_MODEL || defaultModel;
-  const model = session?.model || (validateModel(provider, envModel) ? envModel : defaultModel);
-  const key = session?.keys[provider] || getEnvironmentKey(provider);
-  const sourceFor = (keyProvider: AiProvider): 'session' | 'persistent' | 'environment' | 'none' =>
-    session?.keys[keyProvider]
-      ? session.persistedKeys.has(keyProvider) ? 'persistent' : 'session'
-      : getEnvironmentKey(keyProvider) ? 'environment' : 'none';
-  const keySource = sourceFor(provider);
-  const keySources: Record<AiProvider, 'session' | 'persistent' | 'environment' | 'none'> = {
-    gemini: sourceFor('gemini'),
-    openai: sourceFor('openai'),
-    anthropic: sourceFor('anthropic'),
-    huggingface: sourceFor('huggingface'),
-  };
-  return {
-    provider,
-    model,
-    thinkingLevel: session?.thinkingLevel || 'medium',
-    key,
-    keySource,
-    keySources,
-    publicSettings: {
-      provider,
-      model,
-      thinkingLevel: session?.thinkingLevel || 'medium',
-      hasSavedKey: Boolean(key),
-      keySource,
-      maskedKey: key ? '********' : null,
-      models: PROVIDER_MODELS,
-      capabilities: PROVIDER_CAPABILITIES[provider],
-      keyPersistenceAvailable: keyVault.enabled,
-    },
-  };
+  })();
+  return id;
 }
 
-function isAiProvider(value: unknown): value is AiProvider {
-  return value === 'gemini' || value === 'openai' || value === 'anthropic' || value === 'huggingface';
-}
-
-function isNonEmptyText(value: unknown, maxLength: number): value is string {
-  return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength;
-}
-
-function isOptionalText(value: unknown, maxLength: number): boolean {
-  return value === undefined || (typeof value === 'string' && value.length <= maxLength);
-}
-
-function validateReferenceImages(value: unknown): Array<{ mimeType: string; data: string }> {
-  if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > 4) {
-    throw new AiProviderError('Choose no more than four reference images per scene.', 400, 'invalid_reference_images');
-  }
-  const references = value.map((image) => {
-    if (typeof image !== 'string' || image.length > 3_000_000) {
-      throw new AiProviderError('Each reference image must be smaller than 2.2 MB.', 413, 'reference_image_too_large');
-    }
-    const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(image);
-    if (!match) {
-      throw new AiProviderError('Reference images must be PNG, JPEG, or WebP data images.', 400, 'invalid_reference_images');
-    }
-    return { mimeType: match[1], data: match[2] };
-  });
-  if (references.reduce((size, image) => size + image.data.length, 0) > 10_000_000) {
-    throw new AiProviderError('The combined reference images are too large. Use smaller images or fewer references.', 413, 'reference_images_too_large');
-  }
-  return references;
-}
-
-function getEnvironmentKey(provider: AiProvider): string {
-  const keys: Record<AiProvider, string | undefined> = {
-    gemini: process.env.GEMINI_API_KEY,
-    openai: process.env.OPENAI_API_KEY,
-    anthropic: process.env.ANTHROPIC_API_KEY,
-    huggingface: process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN,
-  };
-  return keys[provider] || '';
-}
-
-function persistSessionKeys(sessionId: string, session: ServerSession): void {
-  if (!keyVault.enabled) return;
-  const keys: Partial<Record<AiProvider, string>> = {};
-  for (const [provider, value] of Object.entries(session.keys)) {
-    if (isAiProvider(provider) && typeof value === 'string' && value) keys[provider] = value;
-  }
-  if (Object.keys(keys).length === 0) {
-    keyVault.remove(sessionId);
-    session.persistedKeys.clear();
-    return;
-  }
-  keyVault.save(sessionId, {
-    keys,
-    settings: {
-      ...(session.provider ? { provider: session.provider } : {}),
-      ...(session.model ? { model: session.model } : {}),
-      ...(session.thinkingLevel ? { thinkingLevel: session.thinkingLevel } : {}),
-    },
-  });
-  session.persistedKeys = new Set(Object.keys(keys) as AiProvider[]);
-}
-
-async function loadProviderModels(req: Request, provider: AiProvider, key: string) {
-  const models = key ? await listProviderModels(provider, key) : PROVIDER_MODELS[provider];
-  const sessionId = requestSessionId(req);
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  if (key && session) {
-    session.availableModels[provider] = {
-      ids: models.map((model) => model.id),
-      keyDigest: createHash('sha256').update(key).digest('hex'),
-    };
-  }
-  return models;
-}
-
-const Type = { OBJECT: 'OBJECT', ARRAY: 'ARRAY', STRING: 'STRING', INTEGER: 'INTEGER' } as const;
-
-function sendAiError(res: Response, error: unknown) {
-  const safeError = safeProviderError(error);
-  console.error(`[AI] ${safeError.code}`);
-  return res.status(safeError.status).json({ success: false, error: safeError.message });
-}
-
-function consumeGenerationBudget(req: Request) {
-  const sessionId = requestSessionId(req);
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  if (!session) throw new AiProviderError('AI session is unavailable. Refresh the page and try again.', 503, 'session_unavailable');
-  const now = Date.now();
-  session.generationTimes = session.generationTimes.filter((timestamp) => now - timestamp < 86_400_000);
-  if (session.generationTimes.length >= 100) {
-    throw new AiProviderError('This browser session has reached its daily generation limit. Try again tomorrow.', 429, 'quota_exceeded');
-  }
-  if (session.generationTimes.filter((timestamp) => now - timestamp < 60_000).length >= 10) {
-    throw new AiProviderError('This browser session is generating too quickly. Wait a minute before trying again.', 429, 'rate_limited');
-  }
-  session.generationTimes.push(now);
-}
-
-async function generateTextForRequest(
-  req: Request,
-  prompt: string,
-  options: Pick<GenerateTextOptions, 'systemInstruction' | 'responseSchema'> = {}
-) {
-  const settings = getAiSettings(req);
-  if (!settings.key) {
-    throw new AiProviderError(`Add a ${settings.provider} API key in Settings to enable AI generation.`, 503, 'missing_key');
-  }
-  consumeGenerationBudget(req);
-  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  const modelCache = session?.availableModels[settings.provider];
-  let allowedModels = modelCache?.keyDigest === createHash('sha256').update(settings.key).digest('hex')
-    ? modelCache.ids
-    : [];
-  if (!validateModel(settings.provider, settings.model) && !allowedModels.includes(settings.model)) {
-    const models = await listProviderModels(settings.provider, settings.key);
-    allowedModels = models.map((model) => model.id);
-    if (session) {
-      session.availableModels[settings.provider] = {
-        ids: allowedModels,
-        keyDigest: createHash('sha256').update(settings.key).digest('hex'),
-      };
-    }
-    if (!allowedModels.includes(settings.model)) {
-      throw new AiProviderError('The selected model is no longer available to this provider key. Refresh the model list in Settings and choose another model.', 400, 'unsupported_model');
-    }
-  }
-  return generateText({
-    provider: settings.provider,
-    apiKey: settings.key,
-    model: settings.model,
-    thinkingLevel: settings.thinkingLevel,
-    prompt,
-    allowedModels,
-    ...options,
-  });
-}
-
-function parseStructuredResponse(text: string, schema: Record<string, any>) {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new AiProviderError('The model returned malformed JSON. Try again or choose a different model.', 502, 'malformed_json');
-  }
-  if (!validateJsonSchema(parsed, schema)) {
-    throw new AiProviderError('The model response did not match the required data structure. Try again.', 502, 'invalid_output');
-  }
-  return parsed;
-}
-
-async function getGeminiClient(req: Request) {
-  const settings = getAiSettings(req);
-  if (settings.provider !== 'gemini') {
-    throw new AiProviderError('Image and speech generation currently require Gemini. Select Gemini in Settings; no provider switch was made.', 400, 'unsupported_provider');
-  }
-  if (!settings.key) {
-    throw new AiProviderError('Add a Gemini API key in Settings to generate images or audio.', 503, 'missing_key');
-  }
-  consumeGenerationBudget(req);
-  const { GoogleGenAI } = await import('@google/genai');
-  return new GoogleGenAI({ apiKey: settings.key });
-}
-
-// ==========================================
-// 1. Health & Configuration Endpoint
-// ==========================================
-app.get('/api/health', (_req: Request, res: Response) => {
-  const settings = getAiSettings(_req);
-  const geminiKey = settings.provider === 'gemini' && Boolean(settings.key);
+app.get('/api/health', async (_req: Request, res: ExpressResponse) => {
+  const status = await getLocalStatus();
   res.json({
     status: 'ok',
-    hasGeminiKey: geminiKey,
-    hasAiKey: Boolean(settings.key),
-    provider: settings.provider,
-    model: settings.model,
-    mode: settings.key ? 'live' : 'demo_only',
-    message: settings.key ? 'AI provider is configured.' : 'Add an API key in Settings to enable live generation.',
+    localInference: true,
+    modelsReady: Object.values(status.models).filter((model) => model.ready).length,
+    models: status.models,
+    hardware: status.hardware,
   });
 });
 
-app.get('/api/settings', (req: Request, res: Response) => {
-  res.json({ success: true, data: getAiSettings(req).publicSettings });
+app.get('/api/local/status', async (_req: Request, res: ExpressResponse) => {
+  res.json({ success: true, data: await getLocalStatus() });
 });
 
-app.get('/api/settings/models', async (req: Request, res: Response) => {
-  const provider = req.query.provider || getAiSettings(req).provider;
-  if (!isAiProvider(provider)) {
-    return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
-  }
-  const current = getAiSettings(req);
-  const sessionId = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith('ai_session='))?.slice('ai_session='.length);
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  const key = session?.keys[provider] || getEnvironmentKey(provider) ||
-    (current.provider === provider ? current.key : '');
+app.post('/api/local/install/:kind', async (req: Request, res: ExpressResponse) => {
+  const kind = req.params.kind;
+  if (!(kind in modelConfig)) return res.status(404).json({ success: false, error: 'Unknown local model.' });
   try {
-    const models = await loadProviderModels(req, provider, key);
-    return res.json({ success: true, data: models });
+    const id = kind === 'writing'
+      ? startTextModelInstall()
+      : String((await workerRequest(`/install/${kind}`, { method: 'POST', body: '{}' })).id);
+    return res.status(202).json({ success: true, data: { id } });
   } catch (error) {
-    return sendAiError(res, error);
+    return sendError(res, error);
   }
 });
 
-app.post('/api/settings/models', async (req: Request, res: Response) => {
-  const body = req.body && typeof req.body === 'object' ? req.body : {};
-  const { provider } = body;
-  if (!isAiProvider(provider)) {
-    return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
-  }
-  if (body.apiKey !== undefined && (typeof body.apiKey !== 'string' || body.apiKey.length > 1024)) {
-    return res.status(400).json({ success: false, error: 'The API key value is not valid.' });
-  }
-  const current = getAiSettings(req);
-  const key = typeof body.apiKey === 'string' && body.apiKey.trim()
-    ? body.apiKey.trim()
-    : current.provider === provider ? current.key : '';
+app.get('/api/local/jobs/:id', async (req: Request, res: ExpressResponse) => {
+  const localJob = localJobs.get(req.params.id);
+  if (localJob) return res.json({ success: true, data: localJob });
   try {
-    const models = await loadProviderModels(req, provider, key);
-    return res.json({ success: true, data: models });
+    const job = await workerRequest(`/jobs/${encodeURIComponent(req.params.id)}`);
+    return res.json({ success: true, data: job });
   } catch (error) {
-    return sendAiError(res, error);
+    return sendError(res, error);
   }
 });
 
-app.post('/api/settings', (req: Request, res: Response) => {
-  const sessionId = requestSessionId(req);
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  const { provider, model, thinkingLevel, apiKey } = req.body || {};
-  if (!sessionId || !session || !isAiProvider(provider) ||
-    !['low', 'medium', 'high'].includes(thinkingLevel)) {
-    return res.status(400).json({ success: false, error: 'Choose a supported provider, model, and thinking level.' });
+app.post('/api/local/jobs/:id/cancel', async (req: Request, res: ExpressResponse) => {
+  const job = localJobs.get(req.params.id);
+  if (job?.kind === 'writing') {
+    return res.status(409).json({ success: false, error: 'Ollama model downloads cannot be cancelled by this application.' });
   }
-  if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.length > 1024)) {
-    return res.status(400).json({ success: false, error: 'The API key value is not valid.' });
-  }
-  const selectedProvider = provider as AiProvider;
-  const selectedKey = typeof apiKey === 'string' && apiKey.trim()
-    ? apiKey.trim()
-    : session.keys[selectedProvider] ||
-      getEnvironmentKey(selectedProvider);
-  const modelCache = session.availableModels[selectedProvider];
-  const dynamicModelIsValid = modelCache?.keyDigest === createHash('sha256').update(selectedKey).digest('hex') &&
-    modelCache.ids.includes(model);
-  if (!validateModel(selectedProvider, model) && !dynamicModelIsValid) {
-    return res.status(400).json({ success: false, error: 'Refresh the provider model list and choose a model available to this key.' });
-  }
-  const previous = {
-    provider: session.provider,
-    model: session.model,
-    thinkingLevel: session.thinkingLevel,
-    keys: { ...session.keys },
-    persistedKeys: new Set(session.persistedKeys),
-  };
-  session.provider = selectedProvider;
-  session.model = model;
-  session.thinkingLevel = thinkingLevel;
-  if (typeof apiKey === 'string' && apiKey.trim()) session.keys[selectedProvider] = apiKey.trim();
   try {
-    persistSessionKeys(sessionId, session);
-  } catch {
-    session.provider = previous.provider;
-    session.model = previous.model;
-    session.thinkingLevel = previous.thinkingLevel;
-    session.keys = previous.keys;
-    session.persistedKeys = previous.persistedKeys;
-    console.error('[AI] Provider settings could not be written to the encrypted vault.');
-    return res.status(500).json({
-      success: false,
-      error: 'Could not save provider settings securely. Check the encrypted key-vault file permissions and available disk space.',
+    await workerRequest(`/jobs/${encodeURIComponent(req.params.id)}/cancel`, { method: 'POST', body: '{}' });
+    return res.json({ success: true });
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
+app.post('/api/local/generate/:kind', async (req: Request, res: ExpressResponse) => {
+  const kind = req.params.kind;
+  if (kind !== 'image' && kind !== 'video') {
+    return res.status(404).json({ success: false, error: 'Choose image or video generation.' });
+  }
+  const key = `${kind}`;
+  if (activeGenerations.has(key)) {
+    return res.status(409).json({ success: false, error: `A ${kind} generation is already active.` });
+  }
+  if (!validatePrompt(req.body?.prompt)) {
+    return res.status(400).json({ success: false, error: 'Prompt must contain 1–4,000 characters.' });
+  }
+  const options: unknown = req.body.options;
+  if (options !== undefined && !isRecord(options)) {
+    return res.status(400).json({ success: false, error: 'Generation options must be an object.' });
+  }
+  if (kind === 'image' && options !== undefined) {
+    const { width, height } = options;
+    if (width !== undefined && (typeof width !== 'number' || !Number.isInteger(width) || width < 256 || width > 768 || width % 8) ||
+        height !== undefined && (typeof height !== 'number' || !Number.isInteger(height) || height < 256 || height > 768 || height % 8)) {
+      return res.status(400).json({ success: false, error: 'Image dimensions must be multiples of 8 between 256 and 768.' });
+    }
+  }
+  if (kind === 'video' && options?.duration !== undefined &&
+      (typeof options.duration !== 'number' || !Number.isInteger(options.duration) || options.duration < 2 || options.duration > 6)) {
+    return res.status(400).json({ success: false, error: 'Video duration must be an integer from 2 to 6 seconds.' });
+  }
+  activeGenerations.add(key);
+  try {
+    const result = await workerRequest(`/generate/${kind}`, {
+      method: 'POST',
+      body: JSON.stringify({ prompt: req.body.prompt, options: req.body.options || {} }),
     });
-  }
-  return res.json({ success: true, data: getAiSettings(req).publicSettings });
-});
-
-app.post('/api/settings/test', async (req: Request, res: Response) => {
-  const body = req.body && typeof req.body === 'object' ? req.body : {};
-  const { provider } = body;
-  if (!isAiProvider(provider)) {
-    return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
-  }
-  if (body.apiKey !== undefined && (typeof body.apiKey !== 'string' || body.apiKey.length > 1024)) {
-    return res.status(400).json({ success: false, error: 'The API key value is not valid.' });
-  }
-  const active = getAiSettings(req);
-  const sessionId = requestSessionId(req);
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  const key = typeof body.apiKey === 'string' && body.apiKey.trim()
-    ? body.apiKey.trim()
-    : session?.keys[provider] || getEnvironmentKey(provider) ||
-      (active.provider === provider ? active.key : '');
-  if (!key) return res.status(400).json({ success: false, error: `Enter a ${provider} API key to test.` });
-  try {
-    await testProviderKey(provider, key);
-    return res.json({ success: true, data: { valid: true } });
+    return res.status(202).json({ success: true, data: result });
   } catch (error) {
-    return sendAiError(res, error);
+    return sendError(res, error);
+  } finally {
+    activeGenerations.delete(key);
   }
 });
 
-app.post('/api/settings/key/remove', (req: Request, res: Response) => {
-  const provider = req.body?.provider;
-  if (!isAiProvider(provider)) {
-    return res.status(400).json({ success: false, error: 'Choose a supported provider.' });
+app.post('/api/generate/writing', async (req: Request, res: ExpressResponse) => {
+  if (!validatePrompt(req.body?.prompt, 10_000)) {
+    return res.status(400).json({ success: false, error: 'Prompt must contain 1–10,000 characters.' });
   }
-  const sessionId = requestSessionId(req);
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  if (session && sessionId) {
-    const previousKey = session.keys[provider];
-    const wasPersisted = session.persistedKeys.has(provider);
-    delete session.keys[provider];
-    session.persistedKeys.delete(provider);
-    try {
-      persistSessionKeys(sessionId, session);
-    } catch {
-      if (previousKey) session.keys[provider] = previousKey;
-      if (wasPersisted) session.persistedKeys.add(provider);
-      console.error('[AI] Provider credentials could not be removed from the encrypted vault.');
-      return res.status(500).json({
-        success: false,
-        error: 'Could not remove the provider key securely. Check the encrypted key-vault file permissions and available disk space.',
-      });
-    }
-  }
-  return res.json({ success: true, data: getAiSettings(req).publicSettings });
-});
-
-// ==========================================
-// 2. Script Generation
-// ==========================================
-app.post('/api/ai/script', async (req: Request, res: Response) => {
   try {
-    const {
-      title,
-      idea,
-      contentType,
-      tone,
-      targetAudience,
-      durationMinutes,
-      language,
-      visualStyle,
-    } = req.body;
+    const text = await generateText(req.body.prompt, { tokens: 2048 });
+    return res.json({ success: true, data: { text, model: modelConfig.writing.label } });
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
 
-    if (!isNonEmptyText(idea, 20_000)) {
-      return res.status(typeof idea === 'string' && idea.length > 20_000 ? 413 : 400)
-        .json({ success: false, error: 'Project idea must contain text and be 20,000 characters or fewer.' });
-    }
-    if (![title, tone, targetAudience, language, visualStyle].every((value) => isOptionalText(value, 2_000)) ||
-        (contentType !== undefined && typeof contentType !== 'string') ||
-        (durationMinutes !== undefined &&
-          (typeof durationMinutes !== 'number' || !Number.isFinite(durationMinutes) || durationMinutes < 1 || durationMinutes > 60))) {
-      return res.status(400).json({ success: false, error: 'One or more project generation settings are invalid.' });
-    }
-
-    const systemInstruction = `You are an elite screenwriter and creative director specializing in high-impact narrative and commercial content.
-Generate a structured script tailored for:
-Content Type: ${contentType || 'short_film'}
-Tone: ${tone || 'cinematic'}
-Target Audience: ${targetAudience || 'general'}
-Target Duration: ${durationMinutes || 3} minutes
-Language: ${language || 'English'}
-Visual Style: ${visualStyle || 'cinematic film'}
-
-Format requirements:
-- Title: Engaging and evocative.
-- Logline: 1-2 sentence compelling hook.
-- Synopsis: Detailed 2-3 paragraph overview of the narrative arc and themes.
-- Full Script: Written in standard screenplay format with scene headings (INT./EXT.), character names, dialogue, and vivid action descriptions.`;
-
-    const responseSchema = {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING, description: 'Final project title' },
-            logline: { type: Type.STRING, description: 'Compelling 1-2 sentence logline' },
-            synopsis: { type: Type.STRING, description: 'Narrative overview and themes' },
-            fullScript: { type: Type.STRING, description: 'Screenplay with headings, actions, dialogues' },
-            targetAudienceNotes: { type: Type.STRING, description: 'Pacing and tone advice' },
-          },
-          required: ['title', 'logline', 'synopsis', 'fullScript'],
-        };
-    const response = await generateTextForRequest(
-      req,
-      `Generate a complete structured script based on this idea: "${idea}". Existing working title: "${title || 'Untitled'}"`,
-      { systemInstruction, responseSchema }
+app.post('/api/ai/script', async (req: Request, res: ExpressResponse) => {
+  const { idea, title, contentType, tone, targetAudience, durationMinutes, language, visualStyle } = req.body || {};
+  if (!validatePrompt(idea, 20_000)) return res.status(400).json({ success: false, error: 'Project idea must contain text and be 20,000 characters or fewer.' });
+  try {
+    const data = await generateJson(
+      `Create a complete script for this idea:\n${idea}\nTitle: ${title || 'Untitled'}\nContent type: ${contentType || 'short film'}\nTone: ${tone || 'cinematic'}\nAudience: ${targetAudience || 'general'}\nDuration: ${durationMinutes || 3} minutes\nLanguage: ${language || 'English'}\nVisual style: ${visualStyle || 'cinematic'}\nReturn title, logline, synopsis, fullScript, and targetAudienceNotes.`,
+      'You are a professional screenwriter. Return one JSON object. The fullScript must be a useful screenplay, not an outline.',
+      ['title', 'logline', 'synopsis', 'fullScript'],
     );
-
-    const parsed = parseStructuredResponse(response, responseSchema);
-    return res.json({ success: true, data: parsed });
+    return res.json({ success: true, data });
   } catch (error) {
-    return sendAiError(res, error);
+    return sendError(res, error);
   }
 });
 
-// ==========================================
-// 3. Section Regeneration
-// ==========================================
-app.post('/api/ai/regenerate-section', async (req: Request, res: Response) => {
+app.post('/api/ai/regenerate-section', async (req: Request, res: ExpressResponse) => {
+  const { sectionType, currentScript, projectIdea, instructions } = req.body || {};
+  if (!['title', 'logline', 'synopsis', 'fullScript'].includes(sectionType) || !currentScript ||
+      !validatePrompt(projectIdea, 20_000) || typeof instructions !== 'string' || instructions.length > 4_000) {
+    return res.status(400).json({ success: false, error: 'Provide a valid screenplay section, project idea, and instructions.' });
+  }
   try {
-    const { sectionType, currentScript, projectIdea, instructions } = req.body;
-    const sectionTypes = ['title', 'logline', 'synopsis', 'fullScript'];
-    if (!sectionTypes.includes(sectionType) || !currentScript ||
-        !isNonEmptyText(projectIdea, 20_000) ||
-        !isOptionalText(instructions, 4_000) ||
-        !['title', 'logline', 'synopsis', 'fullScript'].every((field) =>
-          typeof currentScript[field] === 'string')) {
-      return res.status(400).json({ success: false, error: 'Provide a valid screenplay section, current script, project idea, and instructions.' });
-    }
-
-    const prompt = `You are a script doctor and screenwriter.
-Rewrite ONLY the ${sectionType} for the following project:
-Project Idea: ${projectIdea}
-Current Title: ${currentScript?.title}
-Current Logline: ${currentScript?.logline}
-Current Synopsis: ${currentScript?.synopsis}
-
-User Specific Instructions for this rewrite: "${instructions || 'Make it more compelling and cinematic.'}"
-
-Return ONLY the updated content for ${sectionType}. Do not destroy or include the rest of the script.`;
-
-    const response = await generateTextForRequest(req, prompt);
-
-    return res.json({
-      success: true,
-      data: {
-        sectionType,
-        content: response,
-      },
-    });
+    const content = await generateText(
+      `Rewrite only the ${sectionType}.\nProject idea: ${projectIdea}\nCurrent script: ${JSON.stringify(currentScript)}\nInstructions: ${instructions || 'Make it more compelling and cinematic.'}`,
+      { system: 'You are a screenwriter. Return only the revised content with no commentary.' },
+    );
+    return res.json({ success: true, data: { sectionType, content } });
   } catch (error) {
-    return sendAiError(res, error);
+    return sendError(res, error);
   }
 });
 
-// ==========================================
-// 4. World Bible Extraction
-// ==========================================
-app.post('/api/ai/bible', async (req: Request, res: Response) => {
+app.post('/api/ai/bible', async (req: Request, res: ExpressResponse) => {
+  const { script, title, contentType } = req.body || {};
+  if (!validatePrompt(script, 100_000)) return res.status(400).json({ success: false, error: 'A screenplay of 100,000 characters or fewer is required.' });
   try {
-    const { script, title, contentType } = req.body;
-    if (!isNonEmptyText(script, 100_000) || !isOptionalText(title, 2_000) ||
-        (contentType !== undefined && typeof contentType !== 'string')) {
-      return res.status(400).json({ success: false, error: 'A screenplay of 100,000 characters or fewer is required.' });
-    }
-
-    const responseSchema = {
-      type: Type.OBJECT,
-      properties: {
-        visualTheme: { type: Type.STRING, description: 'Overarching visual and cinematography aesthetic' },
-        characters: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              id: { type: Type.STRING },
-              name: { type: Type.STRING },
-              role: { type: Type.STRING, description: 'protagonist, antagonist, supporting, or narrator' },
-              description: { type: Type.STRING },
-              appearance: { type: Type.STRING, description: 'Physical visual characteristics' },
-              personality: { type: Type.STRING },
-              clothing: { type: Type.STRING, description: 'Wardrobe and garments' },
-              visualMarkers: { type: Type.STRING, description: 'Unique identifiers for image prompt consistency' },
-            },
-            required: ['name', 'appearance', 'clothing'],
-          },
-        },
-        locations: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              id: { type: Type.STRING },
-              name: { type: Type.STRING },
-              description: { type: Type.STRING },
-              environment: { type: Type.STRING },
-              visualCharacteristics: { type: Type.STRING },
-              timeAndLighting: { type: Type.STRING },
-            },
-            required: ['name', 'environment'],
-          },
-        },
-        props: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              id: { type: Type.STRING },
-              name: { type: Type.STRING },
-              description: { type: Type.STRING },
-              visualDetails: { type: Type.STRING },
-            },
-            required: ['name'],
-          },
-        },
-      },
-      required: ['visualTheme', 'characters', 'locations'],
-    };
-    const response = await generateTextForRequest(req, `Extract the characters, key locations, and props from this screenplay to establish visual consistency:
-Title: ${title}
-Content Type: ${contentType}
-
-Script text:
-${script}`, {
-      systemInstruction: `You are an art director and production designer.
-Analyze the script and extract:
-1. Characters: Include exact visual traits, age, ethnic appearance/build, wardrobe, and distinct visual markers (e.g. eye color, scars, badges, hair).
-2. Locations: Include setting, architectural vibe, lighting, weather, materials.
-3. Props: Key narrative objects with textures and colors.
-4. Visual Theme: Overarching aesthetic definition for image prompt generation.`,
-    });
-
-    const parsed = parseStructuredResponse(response, responseSchema) as any;
-    // Ensure ids
-    if (parsed.characters) {
-      parsed.characters = parsed.characters.map((c: any, i: number) => ({
-        ...c,
-        id: c.id || `char-${i + 1}`,
-      }));
-    }
-    if (parsed.locations) {
-      parsed.locations = parsed.locations.map((l: any, i: number) => ({
-        ...l,
-        id: l.id || `loc-${i + 1}`,
-      }));
-    }
-    if (parsed.props) {
-      parsed.props = parsed.props.map((p: any, i: number) => ({
-        ...p,
-        id: p.id || `prop-${i + 1}`,
-      }));
-    }
-
-    return res.json({ success: true, data: parsed });
+    const bible = await generateJson(
+      `Extract the visual world from this screenplay.\nTitle: ${title || ''}\nType: ${contentType || ''}\nScreenplay:\n${script}\nReturn visualTheme, characters (name, role, description, appearance, personality, clothing, visualMarkers), locations (name, description, environment, visualCharacteristics, timeAndLighting), and props (name, description, visualDetails).`,
+      'You are a production designer. Return accurate visual details in one JSON object.',
+      ['visualTheme', 'characters', 'locations'],
+    ) as { visualTheme: string; characters: Array<Record<string, unknown>>; locations: Array<Record<string, unknown>>; props?: Array<Record<string, unknown>> };
+    bible.characters = (bible.characters || []).map((character, index) => ({ id: character.id || `char-${index + 1}`, ...character }));
+    bible.locations = (bible.locations || []).map((location, index) => ({ id: location.id || `loc-${index + 1}`, ...location }));
+    bible.props = (bible.props || []).map((prop, index) => ({ id: prop.id || `prop-${index + 1}`, ...prop }));
+    return res.json({ success: true, data: bible });
   } catch (error) {
-    return sendAiError(res, error);
+    return sendError(res, error);
   }
 });
 
-// ==========================================
-// 5. Scene Breakdown
-// ==========================================
-app.post('/api/ai/scenes', async (req: Request, res: Response) => {
+app.post('/api/ai/scenes', async (req: Request, res: ExpressResponse) => {
+  const { script, title, contentType, durationMinutes, bible } = req.body || {};
+  if (!validatePrompt(script, 100_000)) return res.status(400).json({ success: false, error: 'A screenplay of 100,000 characters or fewer is required.' });
   try {
-    const { script, title, contentType, durationMinutes, bible } = req.body;
-    if (!isNonEmptyText(script, 100_000) || !isOptionalText(title, 2_000) ||
-        (contentType !== undefined && typeof contentType !== 'string') ||
-        (durationMinutes !== undefined &&
-          (typeof durationMinutes !== 'number' || !Number.isFinite(durationMinutes) || durationMinutes < 1 || durationMinutes > 60)) ||
-        (bible !== undefined && (!bible || typeof bible !== 'object' ||
-          (bible.characters !== undefined && !Array.isArray(bible.characters)) ||
-          (bible.locations !== undefined && !Array.isArray(bible.locations))))) {
-      return res.status(400).json({ success: false, error: 'Provide a valid screenplay, duration, and optional world bible.' });
-    }
-
-    const bibleContext = bible
-      ? `Visual Theme: ${bible.visualTheme || ''}
-Known Characters: ${(bible.characters || []).map((c: any) => `${c.name}: ${c.appearance}, wearing ${c.clothing}`).join(' | ')}
-Known Locations: ${(bible.locations || []).map((l: any) => `${l.name}: ${l.environment}`).join(' | ')}`
-      : '';
-
-    const responseSchema = {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          id: { type: Type.STRING },
-          sceneNumber: { type: Type.INTEGER },
-          title: { type: Type.STRING },
-          description: { type: Type.STRING },
-          setting: { type: Type.STRING },
-          timeOfDay: { type: Type.STRING },
-          characters: { type: Type.ARRAY, items: { type: Type.STRING } },
-          actions: { type: Type.STRING },
-          dialogue: { type: Type.STRING },
-          cameraDirection: { type: Type.STRING },
-          mood: { type: Type.STRING },
-          visualStyle: { type: Type.STRING },
-          durationSeconds: { type: Type.INTEGER },
-          imagePrompt: { type: Type.STRING },
-          videoPrompt: { type: Type.STRING },
-        },
-        required: ['sceneNumber', 'title', 'description', 'setting', 'cameraDirection', 'durationSeconds', 'imagePrompt'],
-      },
-    };
-    const response = await generateTextForRequest(req, `Break down this screenplay into a sequential list of structured storyboard scenes.
-Title: ${title}
-Content Type: ${contentType}
-Target Duration: ${durationMinutes || 3} minutes
-
-${bibleContext ? `World Bible Context for Visual Consistency:\n${bibleContext}\n` : ''}
-
-Screenplay:
-${script}`, {
-  systemInstruction: `You are an experienced film director and storyboard artist.
-Break down the screenplay into between 4 and 8 key visual scenes.
-For each scene, formulate:
-1. sceneNumber: 1, 2, 3...
-2. title: Short evocative title
-3. description: Core dramatic beat
-4. setting: Location name
-5. timeOfDay: day, night, dusk, dawn, golden_hour, interior_lit, or dim_ambient
-6. characters: Array of character names present
-7. actions: Visible physical movement
-8. dialogue: Snippet of spoken line or voiceover
-9. cameraDirection: Specific framing e.g., "Low-angle close-up", "Wide establishing aerial", "Medium over-the-shoulder"
-10. mood: Emotional tone
-11. visualStyle: Cinematography notes
-12. durationSeconds: Integer 3 to 12
-13. imagePrompt: A masterclass text prompt for image generation that integrates the character appearance, clothing, environment, camera lens, and lighting.
-14. videoPrompt: A prompt for motion/video cameras.`,
-      responseSchema,
-    });
-
-    const parsed = parseStructuredResponse(response, responseSchema) as any[];
-    const scenesWithIds = parsed.map((s: any, idx: number) => ({
-      ...s,
-      id: s.id || `scene-${idx + 1}-${Date.now()}`,
-      sceneNumber: s.sceneNumber || idx + 1,
-      durationSeconds: s.durationSeconds || 5,
-      timeOfDay: s.timeOfDay || 'day',
-      characters: s.characters || [],
+    const result = await generateJson<{ scenes: Array<Record<string, unknown>> }>(
+      `Break this screenplay into a concise sequence of 1–8 scenes (max 8 for resource limits). Title: ${title || ''}; type: ${contentType || ''}; duration: ${durationMinutes || 1} minutes. World reference: ${JSON.stringify(bible || {})}\nScreenplay:\n${script}\nReturn JSON with a "scenes" array; each scene has title, description, setting, timeOfDay, characters, actions, dialogue, cameraDirection, mood, visualStyle, durationSeconds, imagePrompt, videoPrompt.`,
+      'You are a film director and storyboard artist. Return valid JSON. Preserve character/location details and keep visual prompts useful.',
+      ['scenes'],
+    );
+    const scenes = result.scenes;
+    const data = scenes.map((scene, index) => ({
+      id: randomUUID(),
+      sceneNumber: index + 1,
+      title: scene.title || `Scene ${index + 1}`,
+      description: scene.description || '',
+      setting: scene.setting || '',
+      timeOfDay: scene.timeOfDay || 'day',
+      characters: Array.isArray(scene.characters) ? scene.characters : [],
+      actions: scene.actions || '',
+      dialogue: scene.dialogue || '',
+      cameraDirection: scene.cameraDirection || '',
+      mood: scene.mood || '',
+      visualStyle: scene.visualStyle || '',
+      durationSeconds: Number(scene.durationSeconds) || 10,
+      imagePrompt: scene.imagePrompt || scene.description || '',
+      videoPrompt: scene.videoPrompt || '',
     }));
-
-    return res.json({ success: true, data: scenesWithIds });
+    return res.json({ success: true, data });
   } catch (error) {
-    return sendAiError(res, error);
+    return sendError(res, error);
   }
 });
 
-// ==========================================
-// 6. Visual Prompt Regeneration
-// ==========================================
-app.post('/api/ai/visual-prompts', async (req: Request, res: Response) => {
+app.post('/api/ai/visual-prompts', async (req: Request, res: ExpressResponse) => {
+  const { scene, bible, visualStyle } = req.body || {};
+  if (!scene || typeof scene !== 'object') return res.status(400).json({ success: false, error: 'A scene is required.' });
   try {
-    const { scene, bible, visualStyle } = req.body;
-    if (!scene || typeof scene !== 'object' || Array.isArray(scene) ||
-        !isOptionalText(visualStyle, 2_000) ||
-        ![scene.title, scene.description, scene.actions, scene.cameraDirection, scene.setting, scene.timeOfDay, scene.mood]
-          .every((value) => isOptionalText(value, 2_000))) {
-      return res.status(400).json({ success: false, error: 'Provide a valid scene and visual style.' });
-    }
-
-    const prompt = `Synthesize an ultra-detailed, cinematic text prompt for generating a storyboard image:
-Scene Title: ${scene.title}
-Scene Action: ${scene.actions || scene.description}
-Camera Direction: ${scene.cameraDirection}
-Setting: ${scene.setting}
-Lighting/Time: ${scene.timeOfDay}
-Mood: ${scene.mood}
-Visual Style: ${visualStyle || bible?.visualTheme || 'Cinematic 35mm photograph'}
-
-World Bible Details:
-Characters: ${(bible?.characters || []).map((c: any) => `${c.name}: appearance=${c.appearance}, clothing=${c.clothing}, markers=${c.visualMarkers}`).join('; ')}
-Locations: ${(bible?.locations || []).map((l: any) => `${l.name}: environment=${l.environment}`).join('; ')}
-
-Return ONLY the final detailed image prompt. Do not wrap in quotes or formatting.`;
-
-    const response = await generateTextForRequest(req, prompt);
-
-    return res.json({
-      success: true,
-      data: { prompt: response.trim() || scene.imagePrompt },
-    });
+    const prompt = await generateText(
+      `Create one detailed image prompt for this scene. Scene: ${JSON.stringify(scene)}. Character/location reference: ${JSON.stringify(bible || {})}. Style: ${visualStyle || ''}.`,
+      { system: 'You are a visual prompt writer. Return only the prompt.' },
+    );
+    return res.json({ success: true, data: { prompt } });
   } catch (error) {
-    return sendAiError(res, error);
+    return sendError(res, error);
   }
 });
 
-// ==========================================
-// 7. Image Generation (Gemini only)
-// ==========================================
-app.post('/api/ai/generate-image', async (req: Request, res: Response) => {
-  try {
-    const { prompt, aspectRatio = '16:9' } = req.body;
+app.post('/api/ai/generate-image', (_req, res) => res.status(410).json({
+  success: false,
+  error: 'Use POST /api/local/generate/image. Image generation runs asynchronously with the local model.',
+}));
 
-    if (!prompt) {
-      return res.status(400).json({ success: false, error: 'Prompt is required for image generation.' });
-    }
-    if (typeof prompt !== 'string') {
-      return res.status(400).json({ success: false, error: 'Image prompt must be text.' });
-    }
-    if (prompt.length > 10_000) {
-      return res.status(413).json({ success: false, error: 'Image prompts must be 10,000 characters or fewer.' });
-    }
-    if (!['16:9', '9:16', '1:1', '4:3'].includes(aspectRatio)) {
-      return res.status(400).json({ success: false, error: 'Choose a supported image aspect ratio.' });
-    }
-    const settings = getAiSettings(req);
-    if (!PROVIDER_CAPABILITIES[settings.provider].image) {
-      return res.status(400).json({
-        success: false,
-        error: `Image generation is not supported by ${settings.provider}. Select Gemini or OpenAI in Settings; SceneCraft will not switch providers automatically.`,
-      });
-    }
-    if (!settings.key) {
-      throw new AiProviderError(`Add a ${settings.provider} API key in Settings to generate images.`, 503, 'missing_key');
-    }
-    const referenceImages = validateReferenceImages(req.body.referenceImages);
+app.post('/api/ai/audio-tts', (_req, res) => res.status(410).json({
+  success: false,
+  error: 'Cloud text-to-speech has been removed. Existing audio remains playable; no external AI service is used.',
+}));
 
-    if (settings.provider === 'openai') {
-      consumeGenerationBudget(req);
-      return res.json({
-        success: true,
-        data: await generateOpenAiImage({
-          apiKey: settings.key,
-          prompt,
-          aspectRatio,
-          referenceImages,
-        }),
-      });
-    }
-
-    const ai = await getGeminiClient(req);
-    const promptParts = [
-      { text: prompt },
-      ...referenceImages.map((image) => ({
-        inlineData: { mimeType: image.mimeType, data: image.data },
-      })),
-    ];
-    const response = await ai.models.generateContent({
-      model: GEMINI_IMAGE_MODEL,
-      contents: {
-        parts: promptParts,
-      },
-      config: {
-        responseModalities: ['IMAGE'],
-        imageConfig: {
-          aspectRatio: aspectRatio as any,
-        },
-      },
-    });
-
-    let imageUrl: string | null = null;
-    let imageMimeType = 'image/png';
-    const responseParts = response.candidates?.[0]?.content?.parts || [];
-    for (const part of responseParts) {
-      if (part.inlineData && part.inlineData.data) {
-        imageMimeType = part.inlineData.mimeType || imageMimeType;
-        imageUrl = `data:${imageMimeType};base64,${part.inlineData.data}`;
-        break;
-      }
-    }
-
-    if (!imageUrl) {
-      return res.status(500).json({
-        success: false,
-        error: 'Model did not return an image part. Please check the prompt or try again.',
-      });
-    }
-
-    return res.json({
-      success: true,
-      data: {
-        imageUrl,
-        mimeType: imageMimeType,
-      },
-    });
-  } catch (error) {
-    return sendAiError(res, error);
-  }
-});
-
-// ==========================================
-// 8. Audio Speech Synthesis (Gemini only)
-// ==========================================
-app.post('/api/ai/audio-tts', async (req: Request, res: Response) => {
-  try {
-    const { text, speakerRole } = req.body;
-    const settings = getAiSettings(req);
-    const voice = req.body?.voice || (settings.provider === 'openai' ? 'alloy' : 'Kore');
-    const voices = settings.provider === 'openai'
-      ? ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'onyx', 'nova', 'sage', 'shimmer', 'verse', 'marin', 'cedar']
-      : ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
-
-    if (typeof text !== 'string' || text.trim().length === 0) {
-      return res.status(400).json({ success: false, error: 'Text is required for TTS synthesis.' });
-    }
-    if (text.length > 1000) {
-      return res.status(413).json({ success: false, error: 'Audio text must be 1,000 characters or fewer.' });
-    }
-    if (!PROVIDER_CAPABILITIES[settings.provider].speech) {
-      return res.status(400).json({
-        success: false,
-        error: `Speech generation is not supported by ${settings.provider}. Select Gemini or OpenAI in Settings; SceneCraft will not switch providers automatically.`,
-      });
-    }
-    if (typeof voice !== 'string' || !voices.includes(voice)) {
-      return res.status(400).json({ success: false, error: `Choose a supported ${settings.provider} speech voice.` });
-    }
-    if (speakerRole !== undefined && (typeof speakerRole !== 'string' || speakerRole.length > 100)) {
-      return res.status(400).json({ success: false, error: 'Speaker role must be 100 characters or fewer.' });
-    }
-
-    if (settings.provider === 'openai') {
-      if (!settings.key) throw new AiProviderError('Add an OpenAI API key in Settings to generate speech.', 503, 'missing_key');
-      consumeGenerationBudget(req);
-      return res.json({
-        success: true,
-        data: await generateOpenAiSpeech({
-          apiKey: settings.key,
-          text,
-          voice,
-          ...(speakerRole ? { speakerRole } : {}),
-        }),
-      });
-    }
-
-    const ai = await getGeminiClient(req);
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-preview-tts',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text,
-              speechMetadata: {
-                style: speakerRole ? `Dramatic narration, role: ${speakerRole}` : 'Clear cinematic narration',
-              },
-            },
-          ],
-        },
-      ],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voice },
-          },
-        },
-      },
-    });
-
-    const audioPart = response.candidates?.[0]?.content?.parts?.find((part) => part.inlineData?.data)?.inlineData;
-    if (!audioPart?.data) {
-      return res.status(500).json({
-        success: false,
-        error: 'No audio data returned from Gemini TTS model.',
-      });
-    }
-
-    const mimeType = audioPart.mimeType || 'audio/L16;rate=24000';
-    const bytes = Buffer.from(audioPart.data, 'base64');
-    let wavBytes = bytes;
-    let sampleRate = Number(mimeType.match(/rate=(\d+)/i)?.[1] || 24000);
-    if (bytes.subarray(0, 4).toString('ascii') !== 'RIFF') {
-      if (!/pcm|l16/i.test(mimeType)) {
-        throw new AiProviderError('Gemini returned an unsupported audio encoding.', 502, 'unsupported_audio_format');
-      }
-      wavBytes = Buffer.from(pcm16ToWav(bytes, sampleRate));
-    } else {
-      sampleRate = bytes.readUInt32LE(24) || sampleRate;
-    }
-    const audioUrl = `data:audio/wav;base64,${wavBytes.toString('base64')}`;
-    const channels = wavBytes.readUInt16LE(22) || 1;
-    const bitsPerSample = wavBytes.readUInt16LE(34) || 16;
-    const dataSize = wavBytes.readUInt32LE(40);
-
-    return res.json({
-      success: true,
-      data: {
-        audioUrl,
-        duration: Math.max(1, Math.round(dataSize / (sampleRate * channels * bitsPerSample / 8))),
-      },
-    });
-  } catch (error) {
-    return sendAiError(res, error);
-  }
-});
-
-app.use((error: any, _req: Request, res: Response, next: NextFunction) => {
+app.use((error: unknown, _req: Request, res: ExpressResponse, next: NextFunction) => {
   if (res.headersSent) return next(error);
-  const status = error?.type === 'entity.parse.failed' ? 400
-    : error?.type === 'entity.too.large' ? 413 : 500;
-  console.error(`[HTTP] ${status}`);
+  const typed = error as { type?: string };
+  const status = typed.type === 'entity.parse.failed' ? 400 : typed.type === 'entity.too.large' ? 413 : 500;
   return res.status(status).json({
     success: false,
-    error: status === 400 ? 'Request body must contain valid JSON.'
-      : status === 413 ? 'Request body is too large.'
-        : 'The server could not process this request.',
+    error: status === 400 ? 'Request body must contain valid JSON.' : status === 413 ? 'Request body is too large.' : 'The server could not process this request.',
   });
 });
 
-// ==========================================
-// 9. Static Assets & Vite Integration
-// ==========================================
 async function startServer() {
+  const python = existsSync(workerPython)
+    ? workerPython
+    : process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  workerProcess = spawn(python, [path.join(root, 'local_ai_worker.py')], {
+    cwd: root,
+    stdio: 'ignore',
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+  });
+  workerProcess.on('error', (error) => console.error(`[Local AI] Media worker could not start: ${error.message}`));
+  workerProcess.on('exit', (code) => {
+    if (code !== null && code !== 0) console.error(`[Local AI] Media worker exited with code ${code}.`);
+    workerProcess = undefined;
+  });
+
   if (process.env.NODE_ENV === 'production') {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
-    });
+    app.use(express.static(path.resolve(root, 'dist')));
+    app.get('*', (_req, res) => res.sendFile(path.resolve(root, 'dist', 'index.html')));
   } else {
     const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SceneCraft] Studio server active on http://0.0.0.0:${PORT}`);
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`[SceneCraft] Local AI studio active on http://0.0.0.0:${port}`);
+    console.log('[SceneCraft] Generation uses localhost-only inference runtimes; no hosted AI APIs are configured.');
   });
 }
 
-startServer();
+function stopWorker() {
+  workerProcess?.kill();
+}
+process.on('SIGINT', stopWorker);
+process.on('SIGTERM', stopWorker);
+void startServer();

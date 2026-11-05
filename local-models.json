@@ -1,0 +1,38 @@
+{
+  "writing": {
+    "label": "Qwen 2.5 1.5B Instruct",
+    "runtime": "Ollama",
+    "model": "qwen2.5:1.5b",
+    "storage": "about 1.0 GB",
+    "storageBytes": 1000000000,
+    "license": "Apache-2.0",
+    "repository": "https://ollama.com/library/qwen2.5",
+    "minimum": "4 GB system RAM and 2 CPU cores; CPU inference supported",
+    "hardware": { "minRamMb": 4096, "minAvailableRamMb": 1536 },
+    "tasks": ["articles", "scripts", "captions", "rewrites", "summaries", "ideas"]
+  },
+  "image": {
+    "label": "Stable Diffusion 1.5",
+    "runtime": "Diffusers",
+    "model": "sd-legacy/stable-diffusion-v1-5",
+    "storage": "about 4.3 GB",
+    "storageBytes": 4300000000,
+    "license": "CreativeML OpenRAIL-M",
+    "repository": "https://huggingface.co/sd-legacy/stable-diffusion-v1-5",
+    "minimum": "8 GB system RAM and 8 GB GPU VRAM, or 12 GB RAM plus 8 GB available for slow CPU inference",
+    "hardware": { "minRamMb": 8000, "minCpuRamMb": 12000, "minAvailableRamMb": 8000, "minVramMb": 8000 },
+    "tasks": ["text-to-image", "preview", "download", "configurable-dimensions"]
+  },
+  "video": {
+    "label": "CogVideoX 2B",
+    "runtime": "Diffusers",
+    "model": "zai-org/CogVideoX-2b",
+    "storage": "about 6 GB",
+    "storageBytes": 6000000000,
+    "license": "Apache-2.0",
+    "repository": "https://huggingface.co/zai-org/CogVideoX-2b",
+    "minimum": "16 GB GPU VRAM and 32 GB system RAM; CUDA required by this pipeline",
+    "hardware": { "minRamMb": 32000, "minVramMb": 16000, "cuda": true },
+    "tasks": ["text-to-video", "render", "progress", "preview", "download"]
+  }
+}

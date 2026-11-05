@@ -12,6 +12,7 @@ export type ContentType =
   | 'social_media_video';
 
 export type PipelineStage =
+  | 'generate'
   | 'project'
   | 'script'
   | 'bible'

@@ -628,7 +628,7 @@ export const WorldBibleStage: React.FC<WorldBibleStageProps> = ({
                   <span className="text-zinc-500">{editingCharacter.referenceImages?.length || 0}/4</span>
                 </div>
                 <p className="mb-2 text-[11px] text-zinc-500">
-                  Gemini and OpenAI image models receive these references for matching scenes. PNG, JPEG, or WebP; up to 2 MB each.
+                  Saved with this project for reference only; the current local image model does not use reference images.
                 </p>
                 <div className="flex flex-wrap gap-2">
                   {(editingCharacter.referenceImages || []).map((image, index) => (

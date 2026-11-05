@@ -9,25 +9,22 @@ Thank you for your interest in contributing to **SceneCraft**! We welcome commun
 ### 1. Prerequisites
 - **Node.js**: v20 or higher (v22 recommended)
 - **npm**: v10 or higher
-- **Gemini API Key**: (Optional for local testing; demo mode is functional without it)
+- **Ollama** for local text inference
+- **Python 3.11** for the local Diffusers media runtime (supported GPU hardware needed for video)
 
 ### 2. Setup
 1. Fork and clone the repository:
    ```bash
-   git clone https://github.com/Pradyut-S1n5h/AI-Content-Pipeline-Re-coded.git
-   cd AI-Content-Pipeline-Re-coded
+   git clone https://github.com/Pradyut-S1n5h/AI-Content-Pipeline-Remade.git
+   cd AI-Content-Pipeline-Remade
    ```
 2. Install dependencies:
    ```bash
-   npm install
+   npm ci
    ```
-3. Copy environment configuration:
+3. Configure the local media runtime (optional for frontend-only work):
    ```bash
-   cp .env.example .env
-   ```
-4. (Optional) Add your Gemini API key to `.env`:
-   ```env
-   GEMINI_API_KEY="your-gemini-api-key-here"
+   npm run setup:local-ai
    ```
 
 ### 3. Running Development Server
@@ -66,10 +63,10 @@ npm run build
 
 ## Architecture Principles
 
-1. **Security First**: Never expose API keys to client-side bundles. All Gemini SDK calls must remain inside `server.ts`.
+1. **Local inference only**: Keep generation on the configured loopback runtimes. Do not add hosted AI APIs, credentials, or remote inference fallbacks.
 2. **Anti-Slop Design**: Follow the strict design constitution: zero pill capsule enclosures for static metadata, natural title-case prose, clear visual hierarchy, accessible contrast.
-3. **No Fake Features**: If an external API or service is required, either provide a real implementation or clearly document the limitation with a graceful fallback.
-4. **Structured Output**: Use JSON Schemas for AI generation rather than regex parsing of free-form text.
+3. **No Fake Features**: Report missing models, unsupported hardware, and inference errors instead of simulating generated output.
+4. **Structured Output**: Validate local model output before updating project content.
 
 ---
 

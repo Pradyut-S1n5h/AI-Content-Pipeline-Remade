@@ -13,6 +13,7 @@ import {
   Trash2,
   Copy,
   Info,
+  Sparkles,
   LucideIcon,
 } from 'lucide-react';
 
@@ -40,6 +41,13 @@ export const ProjectOverview: React.FC<ProjectOverviewProps> = ({
     icon: LucideIcon;
     count?: string;
   }[] = [
+    {
+      stage: 'generate',
+      title: '00. Local AI Generation',
+      description: 'Generate writing, images, and rendered video with three local models',
+      icon: Sparkles,
+      count: 'Writing · Image · Video',
+    },
     {
       stage: 'script',
       title: '02. Screenplay & Story',
@@ -71,7 +79,7 @@ export const ProjectOverview: React.FC<ProjectOverviewProps> = ({
     {
       stage: 'audio',
       title: '06. Voice Audio',
-      description: 'Scene dialogue and narration synthesis with Gemini TTS',
+      description: 'Review and play audio already saved in this project',
       icon: Mic,
       count: `${project.scenes.filter((s) => s.audioUrl).length}/${project.scenes.length} Voiced`,
     },

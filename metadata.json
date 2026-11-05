@@ -1,6 +1,6 @@
 {
-  "name": "SceneCraft - AI Content Pipeline",
-  "description": "Turn user ideas into structured content projects: scriptwriting, scene breakdown, world bible, storyboard generation, audio narration, and video assembly.",
+  "name": "SceneCraft - Local AI Content Pipeline",
+  "description": "Locally generate writing, images, and videos, then organize them in a structured content pipeline.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": ["LOCAL_TEXT_IMAGE_VIDEO_GENERATION"]
 }

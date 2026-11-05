@@ -8,3 +8,7 @@ coverage/
 .env.*
 !.env.example
 .scenecraft/
+.local-ai/
+.venv-ai/
+__pycache__/
+*.py[cod]
